@@ -1,0 +1,19 @@
+{
+  "name": "sala-privada",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Voz, vídeo, compartilhamento de tela e música com os amigos.",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "icons": "node scripts/make-icons.mjs",
+    "sounds": "node scripts/make-sounds.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "ws": "^8.22.1"
+  }
+}

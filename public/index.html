@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sala Privada</title>
+  <meta name="description" content="Voz, vídeo, compartilhamento de tela e música com os amigos.">
+  <meta name="theme-color" content="#0d0e12">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/icons/icon-192.png" type="image/png" sizes="192x192">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Sala Privada">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="stylesheet" href="/app.css">
+  <!-- Ajusta diferenças de WebRTC entre navegadores (o Cloudflare recomenda para Firefox e Safari). -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/webrtc-adapter/8.1.2/adapter.min.js" integrity="sha512-l40eBFtXx+ve5RryIELC3y6/OM6Nu89mLGQd7fg1C93tN6XrkC3supb+/YiD/Y+B8P37kdJjtG1MT1kOO2VzxA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script type="module" src="/js/app.js"></script>
+</head>
+<body>
+  <section id="join" class="join">
+    <form id="join-form" class="join-card" autocomplete="on">
+      <img class="join-logo" src="/icons/icon.svg" alt="" width="56" height="56">
+      <h1>Sala Privada</h1>
+      <p class="sub">Voz, vídeo, telas e música com a galera.</p>
+
+      <div class="field">
+        <label for="join-name">Seu nome</label>
+        <input id="join-name" class="input" maxlength="32" placeholder="Como te chamam?" autocomplete="nickname" required>
+      </div>
+      <div class="field" id="join-pass-field" hidden>
+        <label for="join-pass">Senha da sala</label>
+        <input id="join-pass" class="input" type="password" autocomplete="current-password">
+      </div>
+
+      <label class="toggle-row"><span class="toggle-text"><span data-icon="mic"></span>Entrar com o microfone ligado</span><input type="checkbox" class="switch" id="join-mic"></label>
+      <label class="toggle-row"><span class="toggle-text"><span data-icon="video"></span>Entrar com a câmera ligada</span><input type="checkbox" class="switch" id="join-cam"></label>
+
+      <p class="form-error" id="join-error" role="alert"></p>
+      <button class="btn block" id="join-btn" type="submit">Entrar na sala</button>
+      <button class="btn secondary block" type="button" data-install hidden><span data-icon="download"></span>Instalar o app</button>
+
+      <p class="presence"><span class="dot-live"></span><span id="presence">Vendo quem está na sala…</span></p>
+      <p class="warning" id="join-warning" hidden>Voz e vídeo ainda não foram configurados no servidor. O chat e a música já funcionam.</p>
+    </form>
+  </section>
+
+  <div id="room" class="room" hidden>
+    <header class="topbar">
+      <div class="brand"><img src="/icons/icon.svg" alt="" width="28" height="28"><span>Sala Privada</span></div>
+      <div class="mini-player" id="mini" hidden>
+        <span data-icon="music" class="mini-icon"></span>
+        <button class="mini-title" id="mini-title" type="button"></button>
+        <button class="icon-btn sm" id="mini-toggle" type="button" aria-label="Tocar ou pausar a música"></button>
+        <button class="icon-btn sm" id="mini-skip" type="button" aria-label="Próxima música" data-icon="skip"></button>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn secondary small" type="button" data-install hidden><span data-icon="download"></span><span class="hide-sm">Instalar app</span></button>
+        <button class="icon-btn" id="btn-side" type="button" aria-label="Mostrar ou esconder o painel" title="Mostrar ou esconder o painel" data-icon="panel"></button>
+        <button class="icon-btn" id="btn-settings" type="button" aria-label="Configurações" title="Configurações" data-icon="settings"></button>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="stage" id="stage">
+        <div class="livebar" id="livebar" hidden></div>
+        <div class="focus" id="focus" hidden></div>
+        <div class="grid" id="grid"></div>
+      </section>
+
+      <aside class="side">
+        <nav class="tabs" role="tablist">
+          <button class="tab" data-tab="people" role="tab" type="button"><span data-icon="users"></span>Pessoas <span class="count" id="people-count">0</span></button>
+          <button class="tab" data-tab="music" role="tab" type="button"><span data-icon="music"></span>Música</button>
+          <button class="tab" data-tab="chat" role="tab" type="button"><span data-icon="chat"></span>Chat <span class="badge" id="chat-badge" hidden></span></button>
+          <button class="tab" data-tab="files" role="tab" type="button"><span data-icon="paperclip"></span>Arquivos <span class="count" id="files-count"></span></button>
+        </nav>
+
+        <div class="panel" data-panel="people">
+          <ul class="people" id="people"></ul>
+        </div>
+
+        <div class="panel music" data-panel="music">
+          <div class="yt-wrap"><div id="yt-player"></div><div class="yt-empty" id="yt-empty">Nenhuma música tocando</div></div>
+          <div class="np">
+            <div class="np-title" id="np-title"></div>
+            <div class="np-by" id="np-by"></div>
+          </div>
+          <div class="progress" id="progress" role="slider" aria-label="Posição da música" tabindex="0"><div class="progress-fill" id="progress-fill"></div></div>
+          <div class="times"><span id="time-cur">0:00</span><span id="time-dur">0:00</span></div>
+          <div class="music-ctl">
+            <button class="round primary" id="music-toggle" type="button" aria-label="Tocar ou pausar"></button>
+            <button class="round" id="music-skip" type="button" aria-label="Próxima" data-icon="skip"></button>
+            <label class="music-vol" title="Volume da música (só para você)"><span data-icon="volume"></span><input type="range" id="music-volume" min="0" max="100" aria-label="Volume da música"></label>
+          </div>
+          <form class="inline-form" id="music-form">
+            <input class="input" id="music-url" placeholder="Cole um link do YouTube" inputmode="url" autocomplete="off">
+            <button class="btn square" type="submit" aria-label="Adicionar à fila" data-icon="plus"></button>
+          </form>
+          <h3 class="section-title">Próximas <span id="queue-count"></span></h3>
+          <ul class="queue" id="queue"></ul>
+          <p class="hint" id="queue-empty">A fila está vazia.</p>
+        </div>
+
+        <div class="panel chat" data-panel="chat">
+          <div class="messages" id="messages"></div>
+          <form class="inline-form chat-form" id="chat-form">
+            <input class="input" id="chat-input" placeholder="Mensagem" maxlength="1000" autocomplete="off">
+            <button class="btn square" type="submit" aria-label="Enviar" data-icon="send"></button>
+          </form>
+        </div>
+
+        <div class="panel files-panel" data-panel="files">
+          <label class="dropzone" id="dropzone">
+            <input type="file" id="file-input" multiple hidden>
+            <span data-icon="upload"></span>
+            <strong>Enviar arquivos</strong>
+            <span class="dropzone-hint" id="files-hint">Clique ou arraste aqui.</span>
+          </label>
+          <ul class="files" id="files"></ul>
+          <p class="hint" id="files-empty">Nenhum arquivo na sala.</p>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="controls">
+      <button class="ctl" id="btn-mic" type="button"></button>
+      <button class="ctl" id="btn-deafen" type="button"></button>
+      <button class="ctl" id="btn-cam" type="button"></button>
+      <button class="ctl" id="btn-screen" type="button"></button>
+      <button class="ctl" id="btn-sounds" type="button" aria-label="Mesa de sons" title="Mesa de sons" aria-expanded="false" data-icon="sparkles"></button>
+      <button class="ctl leave" id="btn-leave" type="button" aria-label="Sair da sala" title="Sair da sala" data-icon="leave"></button>
+    </footer>
+
+    <section class="soundpad" id="soundpad" hidden aria-label="Mesa de sons">
+      <div class="soundpad-head">
+        <strong>Mesa de sons</strong>
+        <label class="soundpad-vol" title="Volume dos sons (só para você)"><span data-icon="volume"></span><input type="range" id="sound-volume" min="0" max="100" aria-label="Volume dos sons"></label>
+        <button class="icon-btn sm" id="soundpad-close" type="button" aria-label="Fechar a mesa de sons" data-icon="x"></button>
+      </div>
+      <div class="soundpad-grid" id="soundpad-grid"></div>
+      <p class="hint">Todo mundo na sala ouve. Clique com o botão direito num som seu para tirar.</p>
+    </section>
+    <div class="sound-flash" id="sound-flash" hidden></div>
+  </div>
+
+  <div class="drop-overlay" id="drop-overlay" hidden><div>Solte para enviar à sala</div></div>
+  <div class="banner" id="banner" hidden>Conexão perdida. Reconectando…</div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <div id="audio-sink" hidden></div>
+
+  <dialog id="settings" aria-labelledby="settings-title">
+    <form method="dialog" class="dialog">
+      <div class="dialog-head">
+        <h2 id="settings-title">Configurações</h2>
+        <button class="icon-btn" value="close" aria-label="Fechar" data-icon="x"></button>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="set-name">Seu nome</label>
+          <input id="set-name" class="input" maxlength="32" autocomplete="nickname">
+        </div>
+        <div class="field">
+          <label for="set-mic">Microfone</label>
+          <select id="set-mic" class="input"></select>
+        </div>
+        <div class="field" id="set-out-field">
+          <label for="set-out">Saída de áudio</label>
+          <select id="set-out" class="input"></select>
+        </div>
+        <div class="field">
+          <label for="set-cam">Câmera</label>
+          <select id="set-cam" class="input"></select>
+        </div>
+        <label class="toggle-row"><span>Redução de ruído no microfone</span><input type="checkbox" class="switch" id="set-noise"></label>
+        <div class="field">
+          <label for="set-quality">Qualidade ao compartilhar tela</label>
+          <select id="set-quality" class="input">
+            <option value="720p30">720p · 30 fps (gasta menos)</option>
+            <option value="1080p30">1080p · 30 fps (recomendado)</option>
+            <option value="1080p60">1080p · 60 fps (jogos)</option>
+          </select>
+        </div>
+        <label class="toggle-row"><span>Abrir as telas dos amigos automaticamente</span><input type="checkbox" class="switch" id="set-autowatch"></label>
+        <div class="usage">
+          <div class="usage-head"><span>Uso grátis do mês</span><span id="usage-text">—</span></div>
+          <div class="usage-bar"><div id="usage-fill"></div></div>
+          <p class="hint">Se chegar no limite, câmera e telas pausam até o mês virar. A voz continua.</p>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="sound-dialog" aria-labelledby="sound-title">
+    <form class="dialog" id="sound-form">
+      <div class="dialog-head">
+        <h2 id="sound-title">Adicionar som</h2>
+        <button class="icon-btn" type="button" value="close" id="sound-cancel" aria-label="Fechar" data-icon="x"></button>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="sound-file">Arquivo de áudio</label>
+          <input id="sound-file" class="input file-input" type="file" accept="audio/*" required>
+          <p class="hint">MP3, WAV, OGG… até 2 MB e 15 segundos.</p>
+        </div>
+        <div class="sound-name-row">
+          <div class="field emoji-field">
+            <label for="sound-emoji">Emoji</label>
+            <input id="sound-emoji" class="input" maxlength="4" placeholder="🔊" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="sound-name">Nome do botão</label>
+            <input id="sound-name" class="input" maxlength="24" placeholder="Ex.: Risada do Dan" required autocomplete="off">
+          </div>
+        </div>
+        <p class="form-error" id="sound-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button class="btn secondary" type="button" id="sound-preview">Ouvir antes</button>
+          <button class="btn" type="submit" id="sound-save">Adicionar à mesa</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="install-help" aria-labelledby="install-title">
+    <form method="dialog" class="dialog">
+      <div class="dialog-head">
+        <h2 id="install-title">Instalar o app</h2>
+        <button class="icon-btn" value="close" aria-label="Fechar" data-icon="x"></button>
+      </div>
+      <div class="dialog-body install-steps">
+        <div><strong>iPhone ou iPad (Safari)</strong><p>Toque em Compartilhar e depois em <em>Adicionar à Tela de Início</em>.</p></div>
+        <div><strong>Android (Chrome)</strong><p>Abra o menu ⋮ e toque em <em>Instalar app</em> ou <em>Adicionar à tela inicial</em>.</p></div>
+        <div><strong>PC (Chrome, Edge ou Brave)</strong><p>Clique no ícone de instalar na barra de endereço, ou abra o menu e escolha <em>Instalar Sala Privada</em>.</p></div>
+        <p class="hint">O Firefox não instala apps assim. Use Chrome, Edge ou Brave.</p>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
