@@ -1,0 +1,16 @@
+services:
+  sala-privada:
+    build: .
+    image: sala-privada:latest
+    container_name: sala-privada
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    ports:
+      # Só a rede do Docker enxerga a porta; o container do cloudflared chega em http://172.17.0.1:8380.
+      - "172.17.0.1:8380:8380"
+    volumes:
+      - dados:/data
+
+volumes:
+  dados:
