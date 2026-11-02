@@ -1,7 +1,18 @@
 // Service worker: guarda a casca do app para abrir rápido e permitir instalar.
 // Sempre tenta a rede primeiro, então atualizações aparecem na hora.
-const CACHE = 'sala-privada-v1';
-const SHELL = ['/', '/app.css', '/js/app.js', '/js/rtc.js', '/js/music.js', '/js/icons.js', '/manifest.webmanifest', '/icons/icon.svg', '/icons/icon-192.png'];
+const CACHE = 'sala-privada-v3';
+const SHELL = [
+  '/',
+  '/app.css',
+  '/js/app.js',
+  '/js/rtc.js',
+  '/js/music.js',
+  '/js/icons.js',
+  '/js/explain.js',
+  '/manifest.webmanifest',
+  '/icons/icon.svg',
+  '/icons/icon-192.png',
+];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

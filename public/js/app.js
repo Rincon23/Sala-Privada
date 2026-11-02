@@ -1,3 +1,4 @@
+import { explain } from './explain.js';
 import { icon } from './icons.js';
 import { MusicPlayer } from './music.js';
 import { RtcApi, SfuConnection } from './rtc.js';
@@ -30,6 +31,7 @@ const QUALITY = {
 };
 const SURFACE_NAMES = { monitor: 'Tela', window: 'Janela', browser: 'Aba' };
 const QUOTA_MSG = 'O limite gratuito de vídeo deste mês acabou. A voz continua funcionando.';
+const REBUILD_DELAYS = [0, 2000, 5000, 10000, 20000, 30000];
 const canShareScreen = !!navigator.mediaDevices?.getDisplayMedia;
 
 const settings = {
@@ -48,6 +50,8 @@ const state = {
   leaving: false,
   participants: new Map(),
   streams: new Map(),
+  files: new Map(),
+  sounds: [],
   chat: [],
   music: null,
   usage: null,
@@ -72,6 +76,8 @@ const tiles = new Map();
 const meters = new Map();
 const clockSamples = [];
 const usageSeen = new Map();
+const recentErrors = new Map();
+const rebuildAttempts = { sender: 0, receiver: 0 };
 
 let ws = null;
 let api = null;
@@ -91,8 +97,6 @@ let usagePc = null;
 
 const serverNow = () => Date.now() + state.clockOffset;
 const randomId = () => Math.random().toString(36).slice(2, 10);
-
-init();
 
 // ---------- entrada ----------
 
@@ -175,7 +179,15 @@ function connect() {
   ws = socket;
   socket.addEventListener('open', () => {
     reconnectDelay = 1000;
-    send({ type: 'join', name: joinInfo.name, password: joinInfo.password, micOn: state.micOn, deafened: state.deafened, resume: state.me });
+    send({
+      type: 'join',
+      name: joinInfo.name,
+      password: joinInfo.password,
+      micOn: state.micOn,
+      deafened: state.deafened,
+      resume: state.me,
+      version: state.config?.version,
+    });
     for (let i = 0; i < 3; i++) setTimeout(ping, i * 400);
   });
   socket.addEventListener('message', (event) => {
@@ -248,6 +260,24 @@ function onMessage(msg) {
       return onMusic(msg.music);
     case 'usage':
       return onUsage(msg.usage);
+    case 'republish':
+      return onRepublishRequest();
+    case 'file:added':
+      state.files.set(msg.file.id, msg.file);
+      return renderFiles();
+    case 'file:removed':
+      state.files.delete(msg.id);
+      return renderFiles();
+    case 'sound:play': {
+      const sound = state.sounds.find((s) => s.id === msg.id);
+      return sound && playSound(sound, msg.by);
+    }
+    case 'sound:added':
+      state.sounds.push(msg.sound);
+      return renderSoundpad();
+    case 'sound:removed':
+      state.sounds = state.sounds.filter((s) => s.id !== msg.id);
+      return renderSoundpad();
   }
 }
 
@@ -255,9 +285,16 @@ function onWelcome(msg) {
   const previousId = state.me?.id;
   state.me = msg.you;
   $('#banner').hidden = true;
+  if (msg.version && state.config?.version && msg.version !== state.config.version && !state.updateOffered) {
+    state.updateOffered = true;
+    toast('Saiu uma versão nova do app.', { action: 'Atualizar', onAction: () => location.reload(), timeout: 10 * 60_000 });
+  }
   state.participants = new Map(msg.state.participants.map((p) => [p.id, p]));
   state.streams = new Map(msg.state.streams.map((s) => [s.id, s]));
+  state.files = new Map(msg.state.files.map((f) => [f.id, f]));
+  state.sounds = msg.state.sounds;
   state.chat = msg.state.chat;
+  refreshAuthCookie();
   for (const id of state.watching) if (!state.streams.has(id)) state.watching.delete(id);
 
   if (!state.inRoom) enterRoom();
@@ -272,6 +309,8 @@ function onWelcome(msg) {
   onUsage(msg.state.usage);
   onMusic(msg.state.music);
   renderChat();
+  renderFiles();
+  renderSoundpad();
   renderAll();
   reconcile();
 }
@@ -319,7 +358,10 @@ function enterRoom() {
 
   setInterval(ping, 15000);
   setInterval(reportUsage, 15000);
+  setInterval(checkHealth, 3000);
   setInterval(updateSpeaking, 100);
+  setInterval(renderFiles, 60000);
+  $('#files-hint').textContent = `Clique ou arraste aqui. Até ${state.config.fileMaxGB} GB cada; somem em ${state.config.fileTtlHours} h.`;
   new ResizeObserver(layoutGrid).observe($('#grid'));
 
   if (!state.config.realtimeReady) {
@@ -344,28 +386,35 @@ function leave() {
 // ---------- transmitir ----------
 
 function makeConnection(role) {
-  const conn = new SfuConnection(api, state.config.iceServers);
-  conn.addEventListener('failed', () => {
+  const conn = new SfuConnection(api, state.config.iceServers, role === 'sender' ? 'send' : 'receive');
+  conn.addEventListener('failed', (event) => {
     if (state.leaving) return;
-    if (role === 'sender' && sender === conn) rebuildSender();
-    if (role === 'receiver' && receiver === conn) rebuildReceiver();
+    if (role === 'sender' && sender !== conn) return;
+    if (role === 'receiver' && receiver !== conn) return;
+    // Sessão morta no Cloudflare (ex.: 410): não adianta insistir nela, cria outra.
+    const attempt = ++rebuildAttempts[role];
+    const delay = REBUILD_DELAYS[Math.min(attempt - 1, REBUILD_DELAYS.length - 1)];
+    reportError(event.detail, 'connect', role === 'sender' ? 'o que você transmite' : 'o que você recebe', { quiet: attempt < 2 });
+    setTimeout(() => (role === 'sender' ? rebuildSender() : rebuildReceiver()), delay);
   });
   return conn;
 }
 
 async function rebuildSender() {
+  if (state.leaving) return;
   sender = makeConnection('sender');
   for (const entry of localEntries()) {
     try {
       await pushEntry(entry);
       announce(entry);
     } catch (err) {
-      console.warn('Não consegui retransmitir', entry.label, err);
+      if (!sender.closed) reportError(err, 'send', entry.label.toLowerCase());
     }
   }
 }
 
 function rebuildReceiver() {
+  if (state.leaving) return;
   for (const sub of subs.values()) detachAudio(sub);
   subs.clear();
   receiver = makeConnection('receiver');
@@ -381,6 +430,7 @@ async function pushEntry(entry) {
   const res = await sender.push(entry.items.map(({ track, trackName, encodings }) => ({ track, trackName, encodings })));
   entry.mids = res.map((r) => r.mid);
   entry.senders = res.map((r) => r.sender);
+  rebuildAttempts.sender = 0;
 }
 
 function announce(entry) {
@@ -462,7 +512,7 @@ async function startMic() {
     }
     state.micOn = false;
     sendState();
-    toast(mediaError(err, 'mic'));
+    reportError(err, 'mic');
   } finally {
     micStarting = false;
     renderControls();
@@ -557,7 +607,7 @@ async function startCamera() {
       entry.stream.getTracks().forEach((t) => t.stop());
       local.camera = null;
     }
-    toast(err.code === 'quota' ? QUOTA_MSG : mediaError(err, 'cam'));
+    reportError(err, 'cam');
   } finally {
     camStarting = false;
     renderAll();
@@ -581,7 +631,7 @@ async function flipCamera() {
     const stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints() });
     await replaceLocalTrack(entry, stream.getVideoTracks()[0]);
   } catch (err) {
-    toast(mediaError(err, 'cam'));
+    reportError(err, 'cam');
   }
   renderStage();
 }
@@ -601,7 +651,8 @@ async function startScreen() {
       surfaceSwitching: 'include',
     });
   } catch (err) {
-    if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') toast(`Não foi possível compartilhar: ${err.message}`);
+    // NotAllowedError/AbortError aqui é a pessoa cancelando a escolha da tela
+    if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') reportError(err, 'screen', 'o compartilhamento de tela');
     return;
   }
   const video = stream.getVideoTracks()[0];
@@ -622,7 +673,7 @@ async function startScreen() {
       local.screens.delete(id);
       stream.getTracks().forEach((t) => t.stop());
     }
-    toast(err.code === 'quota' ? QUOTA_MSG : `Não foi possível transmitir: ${err.message}`);
+    reportError(err, 'send', `a ${label}`);
   }
   entry.starting = false;
   renderAll();
@@ -674,28 +725,34 @@ function reconcile() {
 }
 
 async function subscribe(stream) {
-  const sub = { stream, mediaStream: new MediaStream(), mids: [], status: 'loading', audioEls: [], muted: false };
+  const conn = receiver;
+  const sub = { stream, mediaStream: new MediaStream(), mids: [], status: 'loading', audioEls: [], muted: false, since: 0 };
   subs.set(stream.id, sub);
   renderStage();
   try {
-    const got = await receiver.pull(stream.tracks.map((t) => ({ sessionId: stream.sessionId, trackName: t.trackName })));
+    const got = await conn.pull(stream.tracks.map((t) => ({ sessionId: stream.sessionId, trackName: t.trackName })));
     if (subs.get(stream.id) !== sub) {
-      receiver.closeTracks(got.map((g) => g.mid)).catch(() => {});
+      conn.closeTracks(got.map((g) => g.mid)).catch(() => {});
       return;
     }
     sub.mids = got.map((g) => g.mid);
     for (const g of got) sub.mediaStream.addTrack(g.track);
     sub.status = 'ok';
+    sub.since = Date.now();
     retries.delete(stream.id);
+    rebuildAttempts.receiver = 0;
     attachAudio(sub);
   } catch (err) {
-    if (subs.get(stream.id) !== sub) return;
+    // Se a conexão inteira caiu, a recriação já vai pedir tudo de novo.
+    if (subs.get(stream.id) !== sub || conn.closed) return;
     sub.status = 'error';
     if (err.code === 'quota') {
-      warnQuota();
+      reportError(err, 'watch');
       if (stream.kind === 'screen') state.watching.delete(stream.id);
     } else {
-      scheduleRetry(stream.id, sub);
+      const attempt = scheduleRetry(stream.id, sub);
+      // A primeira falha costuma ser a transmissão ainda começando; só avisa se insistir.
+      if (attempt >= 3) reportError(err, 'watch', streamLabel(stream));
     }
   }
   renderStage();
@@ -710,6 +767,19 @@ function scheduleRetry(id, sub) {
     subs.delete(id);
     reconcile();
   }, Math.min(2000 * attempt, 30000));
+  return attempt;
+}
+
+function resubscribe(id) {
+  unsubscribe(id);
+  reconcile();
+}
+
+function streamLabel(stream) {
+  const owner = state.participants.get(stream.ownerId)?.name || 'alguém';
+  if (stream.kind === 'mic') return `o áudio de ${owner}`;
+  if (stream.kind === 'camera') return `a câmera de ${owner}`;
+  return `a ${stream.label} de ${owner}`;
 }
 
 function unsubscribe(id) {
@@ -780,7 +850,10 @@ function needAudioUnlock() {
 
 function unlockAudio() {
   try {
-    audioCtx ??= new (window.AudioContext || window.webkitAudioContext)();
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (settings.outId) audioCtx.setSinkId?.(settings.outId).catch(() => {});
+    }
     audioCtx.resume();
   } catch {
     // sem Web Audio: só perde o indicador de fala e os sons
@@ -817,6 +890,122 @@ function updateSpeaking() {
     if (meter.until > now) speaking.add(pid);
   }
   for (const el of $$('[data-speaker]')) el.classList.toggle('speaking', speaking.has(el.dataset.speaker));
+}
+
+// ---------- monitor: o áudio e o vídeo estão chegando? ----------
+
+// Microfone (mesmo mutado) e câmera mandam pacotes o tempo todo; se pararam,
+// a conexão travou. Telas ficam de fora: tela parada pode não mandar nada.
+const STALL_MS = 7000;
+const received = new Map(); // id da faixa -> { packets, changedAt }
+const stalls = new Map(); // id da transmissão -> { count, at }
+let receivedPc = null;
+let sentAudio = { pc: null, packets: 0, changedAt: 0 };
+let lastRepublish = 0;
+
+async function checkHealth() {
+  if (!state.inRoom || state.leaving) return;
+  await checkReceiving();
+  await checkSending();
+}
+
+async function checkReceiving() {
+  const conn = receiver;
+  const pc = conn?.pc;
+  if (!pc || conn.closed) return;
+  if (receivedPc !== pc) {
+    received.clear();
+    receivedPc = pc;
+  }
+  let stats;
+  try {
+    stats = await pc.getStats();
+  } catch {
+    return;
+  }
+  const packetsByTrack = new Map();
+  stats.forEach((r) => {
+    if (r.type === 'inbound-rtp') packetsByTrack.set(r.trackIdentifier, r.packetsReceived || 0);
+  });
+  const now = Date.now();
+  const stalled = [];
+  for (const sub of subs.values()) {
+    if (sub.status !== 'ok' || sub.stream.kind === 'screen' || now - sub.since < STALL_MS) continue;
+    if (!state.participants.get(sub.stream.ownerId)?.online) continue;
+    for (const track of sub.mediaStream.getTracks()) {
+      const packets = packetsByTrack.get(track.id);
+      if (packets === undefined) continue;
+      const seen = received.get(track.id);
+      if (!seen || packets > seen.packets) received.set(track.id, { packets, changedAt: now });
+      else if (now - seen.changedAt > STALL_MS) {
+        stalled.push(sub);
+        break;
+      }
+    }
+  }
+  if (!stalled.length || conn.closed) return;
+  if (stalled.length >= 2) {
+    // Nada de ninguém chegando: o problema é a minha conexão de recepção.
+    conn.fail(Object.assign(new Error('Nada está chegando'), { code: 'receive_stalled' }));
+    return;
+  }
+  const [sub] = stalled;
+  const previous = stalls.get(sub.stream.id);
+  const count = previous && now - previous.at < 120000 ? previous.count + 1 : 1;
+  stalls.set(sub.stream.id, { count, at: now });
+  // Repetiu logo depois de refazer: provavelmente é o lado de quem transmite; o servidor avisa a pessoa.
+  send({ type: 'health', streamId: sub.stream.id, repeated: count > 1 });
+  reportError(Object.assign(new Error('Parou de chegar'), { code: 'stream_stalled' }), 'watch', streamLabel(sub.stream), { quiet: count < 2 });
+  resubscribe(sub.stream.id);
+}
+
+async function checkSending() {
+  const conn = sender;
+  const pc = conn?.pc;
+  if (!pc || conn.closed || !local.mic?.mids.length) return;
+  let stats;
+  try {
+    stats = await pc.getStats();
+  } catch {
+    return;
+  }
+  let packets = 0;
+  stats.forEach((r) => {
+    if (r.type === 'outbound-rtp' && r.kind === 'audio') packets += r.packetsSent || 0;
+  });
+  const now = Date.now();
+  if (sentAudio.pc !== pc || packets > sentAudio.packets) {
+    sentAudio = { pc, packets, changedAt: now };
+  } else if (now - sentAudio.changedAt > STALL_MS) {
+    sentAudio.changedAt = now;
+    conn.fail(Object.assign(new Error('Seu áudio parou de sair'), { code: 'send_stalled' }));
+  }
+}
+
+// O servidor pede quando outras pessoas não estão recebendo o que eu transmito.
+function onRepublishRequest() {
+  const now = Date.now();
+  if (!sender || now - lastRepublish < 30000) return;
+  lastRepublish = now;
+  sender.fail(Object.assign(new Error('Outras pessoas não estavam recebendo'), { code: 'republish' }));
+}
+
+function reportError(err, what, label = '', { quiet = false } = {}) {
+  const info = explain(err, what, label);
+  const key = `${what}|${info.code}|${label}`;
+  const now = Date.now();
+  const last = recentErrors.get(key) || 0;
+  recentErrors.set(key, now);
+  if (now - last < 20000) return;
+  send({
+    type: 'client-error',
+    what,
+    code: info.code,
+    text: info.text,
+    action: info.action,
+    detail: String(err?.message || '').slice(0, 300),
+  });
+  if (!quiet) toast(`${info.text} ${info.action}`, { timeout: 9000 });
 }
 
 // ---------- uso do plano grátis ----------
@@ -1398,6 +1587,421 @@ function seekMusic(event) {
   send({ type: 'music:seek', t: ((event.clientX - rect.left) / rect.width) * duration });
 }
 
+// ---------- arquivos ----------
+
+const uploads = new Map();
+
+function authHeader() {
+  return `Bearer ${state.me.id}:${state.me.token}`;
+}
+
+// O download é um link comum, então a autorização vai num cookie.
+function refreshAuthCookie() {
+  fetch('/api/auth-cookie', { method: 'POST', headers: { Authorization: authHeader() } }).catch(() => {});
+}
+
+async function filesApi(method, path, body) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader() },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw Object.assign(new Error('Sem conexão com o servidor da sala'), { code: 'network' });
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(data.errorDescription || `Erro ${res.status}`), { code: data.errorCode || `http_${res.status}` });
+  return data;
+}
+
+function uploadFiles(list) {
+  if (!list?.length) return;
+  setTab('files');
+  $('#room').classList.remove('side-hidden');
+  for (const file of list) uploadFile(file);
+}
+
+async function uploadFile(file) {
+  const up = { key: randomId(), id: null, name: file.name, size: file.size, sent: 0, xhr: null, cancelled: false, error: '' };
+  uploads.set(up.key, up);
+  renderFiles();
+  try {
+    if (file.size > state.config.fileMaxGB * 1e9) {
+      throw Object.assign(new Error(`"${file.name}" passa do limite de ${state.config.fileMaxGB} GB por arquivo.`), { code: 'file_too_large' });
+    }
+    const { id, chunkSize } = await filesApi('POST', '/api/files', { name: file.name, size: file.size });
+    up.id = id;
+    let offset = 0;
+    while (offset < file.size) {
+      if (up.cancelled) return;
+      offset = await sendChunk(up, file.slice(offset, Math.min(offset + chunkSize, file.size)), offset);
+    }
+    uploads.delete(up.key);
+  } catch (err) {
+    if (up.cancelled) return;
+    up.error = 'Falhou';
+    reportError(err, 'file', `o envio de "${file.name}"`);
+  }
+  renderFiles();
+}
+
+// Manda um pedaço e devolve até onde o servidor já tem. Tenta de novo se a rede piscar.
+function sendChunk(up, blob, offset, attempt = 1) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    up.xhr = xhr;
+    xhr.open('PUT', `/api/files/${up.id}/chunk?offset=${offset}`);
+    xhr.setRequestHeader('Authorization', authHeader());
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => {
+      up.sent = offset + e.loaded;
+      renderUploadProgress(up);
+    };
+    const retry = (data) => {
+      if (up.cancelled) return resolve(offset);
+      // O pedaço chegou mas a resposta se perdeu: segue de onde o servidor parou.
+      if (Number.isFinite(data?.received) && data.received > offset) return resolve(data.received);
+      if (attempt >= 5) {
+        return reject(Object.assign(new Error(data?.errorDescription || 'A conexão caiu várias vezes durante o envio'), { code: data?.errorCode || 'network' }));
+      }
+      setTimeout(() => sendChunk(up, blob, offset, attempt + 1).then(resolve, reject), 1500 * attempt);
+    };
+    xhr.onload = () => {
+      let data = {};
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch {
+        // resposta sem corpo
+      }
+      if (xhr.status === 200) return resolve(data.received);
+      if (xhr.status === 401 || xhr.status === 403 || xhr.status === 404 || xhr.status === 413 || xhr.status === 507) {
+        return reject(Object.assign(new Error(data.errorDescription || `Erro ${xhr.status}`), { code: data.errorCode || `http_${xhr.status}` }));
+      }
+      retry(data);
+    };
+    xhr.onerror = () => retry(null);
+    xhr.send(blob);
+  });
+}
+
+function cancelUpload(key) {
+  const up = uploads.get(key);
+  if (!up) return;
+  up.cancelled = true;
+  up.xhr?.abort();
+  uploads.delete(key);
+  if (up.id) filesApi('DELETE', `/api/files/${up.id}`).catch(() => {});
+  renderFiles();
+}
+
+async function deleteFile(id) {
+  try {
+    await filesApi('DELETE', `/api/files/${id}`);
+  } catch (err) {
+    reportError(err, 'file', 'apagar o arquivo');
+  }
+}
+
+function fmtBytes(bytes) {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} GB`;
+  if (bytes >= 1e6) return `${Math.round(bytes / 1e6)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1e3))} KB`;
+}
+
+function timeLeft(expiresAt) {
+  const minutes = Math.max(0, Math.round((expiresAt - Date.now()) / 60000));
+  if (minutes >= 90) return `some em ${Math.round(minutes / 60)} h`;
+  if (minutes >= 1) return `some em ${minutes} min`;
+  return 'sumindo agora';
+}
+
+function renderUploadProgress(up) {
+  const li = $(`[data-upload="${up.key}"]`);
+  if (!li) return;
+  const pct = up.size ? Math.min(100, (up.sent / up.size) * 100) : 0;
+  $('.file-progress > div', li).style.width = `${pct}%`;
+  $('.file-meta', li).textContent = `Enviando… ${fmtBytes(up.sent)} de ${fmtBytes(up.size)} (${Math.floor(pct)}%)`;
+}
+
+function renderFiles() {
+  if (!state.inRoom) return;
+  const items = [];
+  for (const up of uploads.values()) {
+    const li = document.createElement('li');
+    li.className = 'file uploading';
+    li.dataset.upload = up.key;
+    li.innerHTML = `<span class="file-icon">${icon('upload')}</span><div class="file-main"><div class="file-name"></div><div class="file-meta"></div><div class="file-progress"><div></div></div></div><button class="icon-btn sm" type="button" data-cancel="${up.key}" aria-label="Cancelar envio" title="Cancelar envio">${icon('x')}</button>`;
+    $('.file-name', li).textContent = up.name;
+    if (up.error) {
+      li.classList.add('failed');
+      $('.file-meta', li).textContent = 'O envio falhou. Feche e tente de novo.';
+    }
+    items.push(li);
+  }
+  const myName = state.participants.get(state.me.id)?.name;
+  const sorted = [...state.files.values()].sort((a, b) => b.createdAt - a.createdAt);
+  for (const f of sorted) {
+    const li = document.createElement('li');
+    li.className = 'file';
+    const mine = f.ownerId === state.me.id || f.ownerName === myName;
+    li.innerHTML = `<span class="file-icon">${icon('file')}</span><div class="file-main"><div class="file-name"></div><div class="file-meta"></div></div><a class="icon-btn sm" aria-label="Baixar" title="Baixar">${icon('download')}</a>${mine ? `<button class="icon-btn sm" type="button" data-delete="${f.id}" aria-label="Apagar" title="Apagar">${icon('trash')}</button>` : ''}`;
+    $('.file-name', li).textContent = f.name;
+    $('.file-meta', li).textContent = `${fmtBytes(f.size)} · ${f.ownerName} · ${timeLeft(f.expiresAt)}`;
+    const link = $('a', li);
+    link.href = `/api/files/${encodeURIComponent(f.id)}`;
+    link.download = f.name;
+    items.push(li);
+  }
+  $('#files').replaceChildren(...items);
+  for (const up of uploads.values()) if (!up.error) renderUploadProgress(up);
+  $('#files-empty').hidden = items.length > 0;
+  $('#files-count').textContent = state.files.size || '';
+}
+
+function bindFiles() {
+  $('#file-input').addEventListener('change', (e) => {
+    uploadFiles([...e.target.files]);
+    e.target.value = '';
+  });
+  $('#files').addEventListener('click', (e) => {
+    const cancel = e.target.closest('[data-cancel]');
+    if (cancel) cancelUpload(cancel.dataset.cancel);
+    const del = e.target.closest('[data-delete]');
+    if (del) deleteFile(del.dataset.delete);
+  });
+  // Arrastar arquivos para qualquer lugar da sala.
+  let dragDepth = 0;
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+  document.addEventListener('dragenter', (e) => {
+    if (!state.inRoom || !hasFiles(e)) return;
+    dragDepth++;
+    $('#drop-overlay').hidden = false;
+  });
+  document.addEventListener('dragleave', () => {
+    if (dragDepth && --dragDepth === 0) $('#drop-overlay').hidden = true;
+  });
+  document.addEventListener('dragover', (e) => {
+    if (state.inRoom && hasFiles(e)) e.preventDefault();
+  });
+  document.addEventListener('drop', (e) => {
+    if (!state.inRoom || !hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    $('#drop-overlay').hidden = true;
+    uploadFiles([...e.dataTransfer.files]);
+  });
+}
+
+// ---------- mesa de sons ----------
+
+const soundBuffers = new Map(); // url -> Promise<AudioBuffer>
+const soundsPlaying = new Set();
+let soundVolume = store.get('soundVolume', 70);
+let lastSoundAt = 0;
+let flashTimer = null;
+
+function loadSound(url) {
+  if (!soundBuffers.has(url)) {
+    const loading = fetch(url)
+      .then((res) => {
+        if (!res.ok) throw Object.assign(new Error(`O som não carregou (erro ${res.status})`), { code: `http_${res.status}` });
+        return res.arrayBuffer();
+      })
+      .then((data) => audioCtx.decodeAudioData(data));
+    loading.catch(() => soundBuffers.delete(url));
+    soundBuffers.set(url, loading);
+  }
+  return soundBuffers.get(url);
+}
+
+async function playSound(sound, by) {
+  unlockAudio();
+  if (!audioCtx) return;
+  flashSound(sound, by);
+  if (state.deafened || soundVolume === 0) return;
+  try {
+    const source = audioCtx.createBufferSource();
+    source.buffer = await loadSound(sound.url);
+    const gain = audioCtx.createGain();
+    gain.gain.value = (soundVolume / 100) ** 2;
+    source.connect(gain).connect(audioCtx.destination);
+    // No máximo 4 sons juntos: o mais antigo para.
+    if (soundsPlaying.size >= 4) soundsPlaying.values().next().value.stop();
+    soundsPlaying.add(source);
+    source.onended = () => soundsPlaying.delete(source);
+    source.start();
+  } catch (err) {
+    reportError(err, 'sound', `o som ${sound.name}`);
+  }
+}
+
+function clickSound(id) {
+  const sound = state.sounds.find((s) => s.id === id);
+  const now = Date.now();
+  if (!sound || now - lastSoundAt < 400) return;
+  lastSoundAt = now;
+  playSound(sound, null);
+  send({ type: 'sound:play', id });
+}
+
+function flashSound(sound, by) {
+  const flash = $('#sound-flash');
+  flash.textContent = `${by || 'Você'} tocou ${sound.emoji} ${sound.name}`;
+  flash.hidden = false;
+  flash.classList.remove('show');
+  void flash.offsetWidth;
+  flash.classList.add('show');
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => (flash.hidden = true), 2200);
+}
+
+function renderSoundpad() {
+  if (!state.inRoom) return;
+  const myName = state.participants.get(state.me.id)?.name;
+  const buttons = state.sounds.map((s) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'sound-btn';
+    b.dataset.sound = s.id;
+    const mine = !s.builtin && (s.ownerId === state.me.id || s.ownerName === myName);
+    b.classList.toggle('mine', mine);
+    b.title = s.builtin ? s.name : `${s.name} (de ${s.ownerName})`;
+    b.innerHTML = '<span class="sound-emoji"></span><span class="sound-name"></span>';
+    $('.sound-emoji', b).textContent = s.emoji;
+    $('.sound-name', b).textContent = s.name;
+    return b;
+  });
+  const add = document.createElement('button');
+  add.type = 'button';
+  add.className = 'sound-btn add';
+  add.id = 'sound-add';
+  add.innerHTML = `${icon('plus')}<span class="sound-name">Adicionar</span>`;
+  $('#soundpad-grid').replaceChildren(...buttons, add);
+}
+
+function toggleSoundpad(open = $('#soundpad').hidden) {
+  $('#soundpad').hidden = !open;
+  $('#btn-sounds').classList.toggle('on', open);
+  $('#btn-sounds').setAttribute('aria-expanded', String(open));
+  if (!open) return;
+  renderSoundpad();
+  unlockAudio();
+  // Carrega tudo de antemão para o clique tocar na hora.
+  if (audioCtx) for (const s of state.sounds) loadSound(s.url).catch(() => {});
+}
+
+function onSoundRightClick(id) {
+  const sound = state.sounds.find((s) => s.id === id);
+  if (!sound || sound.builtin) return;
+  toast(`Tirar o som ${sound.emoji} ${sound.name} da mesa?`, {
+    action: 'Tirar',
+    onAction: () => filesApi('DELETE', `/api/sounds/${id}`).catch((err) => reportError(err, 'sound', 'tirar o som')),
+  });
+}
+
+function openSoundDialog() {
+  $('#sound-form').reset();
+  $('#sound-error').textContent = '';
+  $('#sound-save').disabled = false;
+  $('#sound-dialog').showModal();
+}
+
+// Confere se o arquivo é um áudio que o navegador entende e se é curto.
+async function checkSoundFile(file) {
+  if (!file) throw new Error('Escolha um arquivo de áudio.');
+  if (file.size > 2 * 1024 * 1024) throw new Error('O arquivo passa de 2 MB. Corte um trecho menor.');
+  unlockAudio();
+  let buffer;
+  try {
+    buffer = await audioCtx.decodeAudioData(await file.arrayBuffer());
+  } catch {
+    throw new Error('Esse arquivo não parece ser um áudio que o navegador entende. Tente MP3 ou WAV.');
+  }
+  if (buffer.duration > 15.5) throw new Error(`O som tem ${Math.round(buffer.duration)} s; o máximo é 15 s.`);
+  return buffer;
+}
+
+function bindSoundpad() {
+  $('#btn-sounds').addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleSoundpad();
+  });
+  $('#soundpad-close').addEventListener('click', () => toggleSoundpad(false));
+  $('#sound-volume').value = soundVolume;
+  $('#sound-volume').addEventListener('input', (e) => {
+    soundVolume = Number(e.target.value);
+    store.set('soundVolume', soundVolume);
+  });
+  $('#soundpad-grid').addEventListener('click', (e) => {
+    const b = e.target.closest('.sound-btn');
+    if (!b) return;
+    if (b.id === 'sound-add') return openSoundDialog();
+    clickSound(b.dataset.sound);
+    b.classList.remove('pulse');
+    void b.offsetWidth;
+    b.classList.add('pulse');
+  });
+  $('#soundpad-grid').addEventListener('contextmenu', (e) => {
+    const b = e.target.closest('.sound-btn.mine');
+    if (!b) return;
+    e.preventDefault();
+    onSoundRightClick(b.dataset.sound);
+  });
+  document.addEventListener('click', (e) => {
+    if ($('#soundpad').hidden || e.target.closest('#soundpad, #btn-sounds, dialog, .toast')) return;
+    toggleSoundpad(false);
+  });
+
+  $('#sound-file').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (file && !$('#sound-name').value) $('#sound-name').value = file.name.replace(/\.[^.]+$/, '').slice(0, 24);
+  });
+  $('#sound-cancel').addEventListener('click', () => $('#sound-dialog').close());
+  $('#sound-preview').addEventListener('click', async () => {
+    $('#sound-error').textContent = '';
+    try {
+      const buffer = await checkSoundFile($('#sound-file').files[0]);
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      source.start();
+    } catch (err) {
+      $('#sound-error').textContent = err.message;
+    }
+  });
+  $('#sound-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const file = $('#sound-file').files[0];
+    const name = $('#sound-name').value.trim();
+    $('#sound-error').textContent = '';
+    if (!name) return ($('#sound-error').textContent = 'Dê um nome para o botão.');
+    $('#sound-save').disabled = true;
+    try {
+      await checkSoundFile(file);
+      const ext = file.name.split('.').pop().toLowerCase();
+      const res = await fetch('/api/sounds', {
+        method: 'POST',
+        headers: {
+          Authorization: authHeader(),
+          'Content-Type': file.type || `audio/${ext === 'mp3' ? 'mpeg' : ext}`,
+          'X-Sound-Name': encodeURIComponent(name),
+          'X-Sound-Emoji': encodeURIComponent($('#sound-emoji').value.trim()),
+        },
+        body: file,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.errorDescription || `Erro ${res.status} ao enviar o som.`);
+      $('#sound-dialog').close();
+    } catch (err) {
+      $('#sound-error').textContent = err.message;
+    } finally {
+      $('#sound-save').disabled = false;
+    }
+  });
+}
+
 // ---------- configurações ----------
 
 async function openSettings() {
@@ -1443,13 +2047,14 @@ function bindSettings() {
       await replaceLocalTrack(local.mic, stream.getAudioTracks()[0]);
       attachMeter(state.me.id, local.mic.stream);
     } catch (err) {
-      toast(mediaError(err, 'mic'));
+      reportError(err, 'mic');
     }
   });
   $('#set-out').addEventListener('change', (e) => {
     settings.outId = e.target.value;
     store.set('outId', settings.outId);
     for (const el of $$('#audio-sink audio')) el.setSinkId?.(settings.outId).catch(() => {});
+    audioCtx?.setSinkId?.(settings.outId).catch(() => {});
   });
   $('#set-cam').addEventListener('change', async (e) => {
     settings.camId = e.target.value;
@@ -1459,7 +2064,7 @@ function bindSettings() {
       const stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints() });
       await replaceLocalTrack(local.camera, stream.getVideoTracks()[0]);
     } catch (err) {
-      toast(mediaError(err, 'cam'));
+      reportError(err, 'cam');
     }
     renderStage();
   });
@@ -1544,8 +2149,11 @@ function bindRoomUi() {
     if (b) send({ type: 'music:remove', itemId: b.dataset.remove });
   });
   bindSettings();
+  bindFiles();
+  bindSoundpad();
 
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('#soundpad').hidden) return toggleSoundpad(false);
     if (e.key === 'Escape' && state.focusKey && !document.fullscreenElement) {
       state.focusKey = null;
       renderStage();
@@ -1642,10 +2250,5 @@ function toast(text, { action, onAction, timeout = 5000 } = {}) {
   setTimeout(() => el.remove(), timeout);
 }
 
-function mediaError(err, what) {
-  const name = what === 'mic' ? 'o microfone' : 'a câmera';
-  if (err?.name === 'NotAllowedError') return `Sem permissão para usar ${name}. Libere nas permissões do site.`;
-  if (err?.name === 'NotFoundError' || err?.name === 'OverconstrainedError') return `Não encontrei ${name} neste aparelho.`;
-  if (err?.name === 'NotReadableError') return `${what === 'mic' ? 'O microfone' : 'A câmera'} está sendo usado por outro programa.`;
-  return `Problema com ${name}: ${err?.message || err}`;
-}
+// Por último, depois que todas as variáveis do módulo já existem.
+init();

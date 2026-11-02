@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node server/index.js",
-    "icons": "node scripts/make-icons.mjs"
+    "icons": "node scripts/make-icons.mjs",
+    "sounds": "node scripts/make-sounds.mjs"
   },
   "engines": {
     "node": ">=20"

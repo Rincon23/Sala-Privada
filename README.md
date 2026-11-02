@@ -5,6 +5,17 @@ Uma sala só para a galera: voz, câmera, quantas telas e janelas quiser ao mesm
 - **Site e sinalização:** Node.js num container, publicado pelo Cloudflare Tunnel (sem abrir portas).
 - **Voz, vídeo e telas:** Cloudflare Realtime (SFU). Grátis até 1.000 GB por mês; o app para câmera e telas em 900 GB para nunca passar disso.
 - **Música:** player do YouTube em cada pessoa, sincronizado pelo servidor.
+- **Arquivos:** envio em pedaços de 32 MB (passa do limite de 100 MB do Cloudflare), até 10 GB cada; somem sozinhos depois de 24 h.
+- **Mesa de sons:** 11 efeitos gerados por código (`npm run sounds`) e qualquer pessoa pode adicionar os seus (até 2 MB e 15 s).
+- **Monitor:** se o áudio ou a câmera de alguém para de chegar, o app refaz a conexão sozinho; se o problema é de quem transmite, o servidor pede para o app dessa pessoa reconectar.
+
+## Lendo os logs
+
+```bash
+docker logs -f sala-privada
+```
+
+Cada problema aparece com o que aconteceu e, logo abaixo, **→ O que fazer**. Erros que se repetem viram um contador em vez de lotar o log.
 
 ## Rodando no servidor
 
@@ -33,6 +44,9 @@ Depois recrie o container: `docker compose up -d --force-recreate`.
 |---|---|
 | `ROOM_PASSWORD` | Senha da sala. Vazio = entra só com o nome. |
 | `MONTHLY_LIMIT_GB` | Quanto do plano grátis pode ser usado antes de pausar câmera e telas (padrão 900). |
+| `FILE_TTL_HOURS` | Depois de quantas horas um arquivo enviado some (padrão 24). |
+| `FILE_MAX_GB` | Tamanho máximo de cada arquivo (padrão 10). |
+| `FILES_TOTAL_GB` | Espaço total para arquivos no servidor (padrão 50). |
 
 ## Desenvolvendo
 

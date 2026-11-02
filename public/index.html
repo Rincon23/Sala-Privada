@@ -15,6 +15,8 @@
   <meta name="apple-mobile-web-app-title" content="Sala Privada">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="stylesheet" href="/app.css">
+  <!-- Ajusta diferenças de WebRTC entre navegadores (o Cloudflare recomenda para Firefox e Safari). -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/webrtc-adapter/8.1.2/adapter.min.js" integrity="sha512-l40eBFtXx+ve5RryIELC3y6/OM6Nu89mLGQd7fg1C93tN6XrkC3supb+/YiD/Y+B8P37kdJjtG1MT1kOO2VzxA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
   <script type="module" src="/js/app.js"></script>
 </head>
 <body>
@@ -73,6 +75,7 @@
           <button class="tab" data-tab="people" role="tab" type="button"><span data-icon="users"></span>Pessoas <span class="count" id="people-count">0</span></button>
           <button class="tab" data-tab="music" role="tab" type="button"><span data-icon="music"></span>Música</button>
           <button class="tab" data-tab="chat" role="tab" type="button"><span data-icon="chat"></span>Chat <span class="badge" id="chat-badge" hidden></span></button>
+          <button class="tab" data-tab="files" role="tab" type="button"><span data-icon="paperclip"></span>Arquivos <span class="count" id="files-count"></span></button>
         </nav>
 
         <div class="panel" data-panel="people">
@@ -108,6 +111,17 @@
             <button class="btn square" type="submit" aria-label="Enviar" data-icon="send"></button>
           </form>
         </div>
+
+        <div class="panel files-panel" data-panel="files">
+          <label class="dropzone" id="dropzone">
+            <input type="file" id="file-input" multiple hidden>
+            <span data-icon="upload"></span>
+            <strong>Enviar arquivos</strong>
+            <span class="dropzone-hint" id="files-hint">Clique ou arraste aqui.</span>
+          </label>
+          <ul class="files" id="files"></ul>
+          <p class="hint" id="files-empty">Nenhum arquivo na sala.</p>
+        </div>
       </aside>
     </main>
 
@@ -116,10 +130,23 @@
       <button class="ctl" id="btn-deafen" type="button"></button>
       <button class="ctl" id="btn-cam" type="button"></button>
       <button class="ctl" id="btn-screen" type="button"></button>
+      <button class="ctl" id="btn-sounds" type="button" aria-label="Mesa de sons" title="Mesa de sons" aria-expanded="false" data-icon="sparkles"></button>
       <button class="ctl leave" id="btn-leave" type="button" aria-label="Sair da sala" title="Sair da sala" data-icon="leave"></button>
     </footer>
+
+    <section class="soundpad" id="soundpad" hidden aria-label="Mesa de sons">
+      <div class="soundpad-head">
+        <strong>Mesa de sons</strong>
+        <label class="soundpad-vol" title="Volume dos sons (só para você)"><span data-icon="volume"></span><input type="range" id="sound-volume" min="0" max="100" aria-label="Volume dos sons"></label>
+        <button class="icon-btn sm" id="soundpad-close" type="button" aria-label="Fechar a mesa de sons" data-icon="x"></button>
+      </div>
+      <div class="soundpad-grid" id="soundpad-grid"></div>
+      <p class="hint">Todo mundo na sala ouve. Clique com o botão direito num som seu para tirar.</p>
+    </section>
+    <div class="sound-flash" id="sound-flash" hidden></div>
   </div>
 
+  <div class="drop-overlay" id="drop-overlay" hidden><div>Solte para enviar à sala</div></div>
   <div class="banner" id="banner" hidden>Conexão perdida. Reconectando…</div>
   <div class="toasts" id="toasts" aria-live="polite"></div>
   <div id="audio-sink" hidden></div>
@@ -161,6 +188,37 @@
           <div class="usage-head"><span>Uso grátis do mês</span><span id="usage-text">—</span></div>
           <div class="usage-bar"><div id="usage-fill"></div></div>
           <p class="hint">Se chegar no limite, câmera e telas pausam até o mês virar. A voz continua.</p>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="sound-dialog" aria-labelledby="sound-title">
+    <form class="dialog" id="sound-form">
+      <div class="dialog-head">
+        <h2 id="sound-title">Adicionar som</h2>
+        <button class="icon-btn" type="button" value="close" id="sound-cancel" aria-label="Fechar" data-icon="x"></button>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="sound-file">Arquivo de áudio</label>
+          <input id="sound-file" class="input file-input" type="file" accept="audio/*" required>
+          <p class="hint">MP3, WAV, OGG… até 2 MB e 15 segundos.</p>
+        </div>
+        <div class="sound-name-row">
+          <div class="field emoji-field">
+            <label for="sound-emoji">Emoji</label>
+            <input id="sound-emoji" class="input" maxlength="4" placeholder="🔊" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="sound-name">Nome do botão</label>
+            <input id="sound-name" class="input" maxlength="24" placeholder="Ex.: Risada do Dan" required autocomplete="off">
+          </div>
+        </div>
+        <p class="form-error" id="sound-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button class="btn secondary" type="button" id="sound-preview">Ouvir antes</button>
+          <button class="btn" type="submit" id="sound-save">Adicionar à mesa</button>
         </div>
       </div>
     </form>
