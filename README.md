@@ -22,12 +22,12 @@ Cada problema aparece com o que aconteceu e, logo abaixo, **→ O que fazer**. E
 
 ## Rodando no servidor
 
-O servidor monta o app a partir do GitHub, nunca do PC: só entra no ar o que já teve **push**.
+O servidor monta o app a partir da `main` no GitHub, nunca do PC: só entra no ar o que já teve **push** na `main`.
 
 Primeira vez:
 
 ```bash
-git clone -b feat/sala-privada https://github.com/Rincon23/Sala-Privada.git ~/sala-privada
+git clone https://github.com/Rincon23/Sala-Privada.git ~/sala-privada
 cd ~/sala-privada
 cp .env.example .env   # e preencha as chaves do Realtime
 docker compose up -d --build
@@ -39,7 +39,7 @@ Para atualizar, depois do push:
 ssh rincon@100.64.38.33 'cd ~/sala-privada && ./update.sh'
 ```
 
-O `update.sh` baixa a branch em que o servidor está (`git branch` mostra qual), remonta o container e mostra qual commit ficou no ar. Para o servidor passar a seguir outra branch: `git checkout <branch>` na pasta e `./update.sh`. O `.env` fica só no servidor e nunca vai para o GitHub.
+O `update.sh` puxa a `main`, remonta o container e mostra qual commit ficou no ar, com o status e o log. O `.env` fica só no servidor e nunca vai para o GitHub.
 
 No Cloudflare Tunnel, a rota de `live.rincon.dev.br` aponta para `http://172.17.0.1:8380` (o cloudflared roda em Docker na rede padrão).
 
