@@ -45,16 +45,20 @@ const settings = {
 
 const state = {
   config: null,
+  discord: null,
   me: null,
   inRoom: false,
   leaving: false,
   participants: new Map(),
   streams: new Map(),
+  channels: new Map(),
+  musics: new Map(), // id da sala de voz -> música dela
   files: new Map(),
   sounds: [],
-  chat: [],
-  music: null,
+  music: null, // a música da sala de voz em que estou
   usage: null,
+  voice: null, // sala de voz em que estou
+  view: store.get('view', null), // canal de texto aberto no meio da tela
   micOn: store.get('joinMic', true),
   deafened: false,
   micBeforeDeafen: true,
@@ -94,6 +98,9 @@ let camStarting = false;
 let audioUnlockShown = false;
 let quotaWarned = false;
 let usagePc = null;
+let textChat = null;
+let voiceChat = null;
+let authReady = Promise.resolve();
 
 const serverNow = () => Date.now() + state.clockOffset;
 const randomId = () => Math.random().toString(36).slice(2, 10);
@@ -109,6 +116,7 @@ async function init() {
   $('#join-mic').checked = state.micOn;
   $('#join-cam').checked = store.get('joinCam', false);
   $('#join-form').addEventListener('submit', onJoinSubmit);
+  bindDiscord();
   bindRoomUi();
 
   try {
@@ -116,11 +124,57 @@ async function init() {
   } catch {
     state.config = { needsPassword: false, realtimeReady: false, iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] };
   }
+  if (state.config.discord) state.discord = await fetch('/api/discord/me').then((r) => r.json()).catch(() => null);
   $('#join-pass-field').hidden = !state.config.needsPassword;
   $('#join-warning').hidden = state.config.realtimeReady;
+  renderJoinIdentity();
+  showDiscordResult();
   refreshPresence();
   presenceTimer = setInterval(refreshPresence, 10000);
-  if (!$('#join-name').value) $('#join-name').focus();
+  if (state.discord) $('#join-btn').focus();
+  else if (!$('#join-name').value) $('#join-name').focus();
+}
+
+// ---------- login com o Discord ----------
+
+const DISCORD_RESULTS = {
+  cancelado: 'Login com o Discord cancelado.',
+  erro: 'Não deu para entrar com o Discord. Tente de novo.',
+  off: 'O login com o Discord não está configurado no servidor.',
+};
+
+function bindDiscord() {
+  // A página sai para o Discord e volta: guarda as escolhas para não perder.
+  $('#discord-login').addEventListener('click', () => {
+    store.set('joinMic', $('#join-mic').checked);
+    store.set('joinCam', $('#join-cam').checked);
+  });
+  $('#discord-logout').addEventListener('click', async () => {
+    await fetch('/api/discord/logout', { method: 'POST' }).catch(() => {});
+    state.discord = null;
+    renderJoinIdentity();
+    $('#join-name').focus();
+  });
+}
+
+function renderJoinIdentity() {
+  const d = state.discord;
+  $('#join-discord').hidden = !state.config.discord || !!d;
+  $('#join-identity').hidden = !d;
+  $('#join-name-field').hidden = !!d;
+  $('#join-name').required = !d;
+  if (!d) return;
+  paintAvatar($('#join-identity .avatar'), d);
+  $('#join-identity .identity-name').textContent = d.name;
+  $('#join-identity .identity-sub').textContent = `@${d.username} · Discord`;
+}
+
+// O servidor devolve a pessoa com #discord=... quando o login não deu certo.
+function showDiscordResult() {
+  const result = /^#discord=(\w+)$/.exec(location.hash)?.[1];
+  if (!result) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  if (DISCORD_RESULTS[result]) showJoinError(DISCORD_RESULTS[result]);
 }
 
 async function refreshPresence() {
@@ -144,9 +198,9 @@ function listNames(names) {
 
 function onJoinSubmit(event) {
   event.preventDefault();
-  const name = $('#join-name').value.trim().slice(0, 32);
+  const name = state.discord ? state.discord.name : $('#join-name').value.trim().slice(0, 32);
   if (!name) return showJoinError('Digite seu nome.');
-  store.set('name', name);
+  if (!state.discord) store.set('name', name);
   state.micOn = $('#join-mic').checked;
   store.set('joinMic', state.micOn);
   const startCam = $('#join-cam').checked;
@@ -232,21 +286,45 @@ function onMessage(msg) {
       return toast(msg.text);
     case 'participant:joined':
       state.participants.set(msg.participant.id, msg.participant);
-      sound('join');
       return renderAll();
     case 'participant:updated': {
-      const prev = state.participants.get(msg.participant.id);
-      state.participants.set(msg.participant.id, msg.participant);
-      if (prev && prev.name !== msg.participant.name) applyVolumes();
-      renderPeople();
-      return renderStage();
-    }
-    case 'participant:left':
-      state.participants.delete(msg.id);
-      for (const s of [...state.streams.values()]) if (s.ownerId === msg.id) state.streams.delete(s.id);
-      sound('leave');
+      const p = msg.participant;
+      const prev = state.participants.get(p.id);
+      // A minha sala de voz quem decide é este app (o aviso do servidor pode chegar atrasado).
+      if (p.id === state.me?.id) p.voice = state.voice;
+      else if (state.voice && prev?.voice !== p.voice) {
+        if (p.voice === state.voice) sound('join');
+        else if (prev?.voice === state.voice) sound('leave');
+      }
+      state.participants.set(p.id, p);
+      if (prev && prev.name !== p.name) applyVolumes();
       reconcile();
       return renderAll();
+    }
+    case 'participant:left': {
+      const gone = state.participants.get(msg.id);
+      if (state.voice && gone?.voice === state.voice) sound('leave');
+      state.participants.delete(msg.id);
+      for (const s of [...state.streams.values()]) if (s.ownerId === msg.id) state.streams.delete(s.id);
+      reconcile();
+      return renderAll();
+    }
+    case 'voice:ended':
+      leaveVoice({ notify: false });
+      return toast(msg.text);
+    case 'channel:added':
+      state.channels.set(msg.channel.id, msg.channel);
+      if (msg.by === state.me?.id && msg.channel.kind === 'text') return openChannel(msg.channel.id);
+      return renderChannels();
+    case 'channel:updated':
+      state.channels.set(msg.channel.id, msg.channel);
+      return renderAll();
+    case 'channel:removed':
+      return onChannelRemoved(msg.id);
+    case 'chat:history':
+      return onHistory(msg);
+    case 'chat:deleted':
+      return onChatDeleted(msg);
     case 'stream:added':
       return onStreamAdded(msg.stream);
     case 'stream:removed':
@@ -255,9 +333,9 @@ function onMessage(msg) {
       reconcile();
       return renderAll();
     case 'chat':
-      return onChat(msg.message);
+      return onChatMessage(msg.message);
     case 'music':
-      return onMusic(msg.music);
+      return onMusic(msg.channelId, msg.music);
     case 'usage':
       return onUsage(msg.usage);
     case 'republish':
@@ -291,24 +369,31 @@ function onWelcome(msg) {
   }
   state.participants = new Map(msg.state.participants.map((p) => [p.id, p]));
   state.streams = new Map(msg.state.streams.map((s) => [s.id, s]));
+  state.channels = new Map(msg.state.channels.map((c) => [c.id, c]));
+  state.musics = new Map(Object.entries(msg.state.musics));
   state.files = new Map(msg.state.files.map((f) => [f.id, f]));
   state.sounds = msg.state.sounds;
-  state.chat = msg.state.chat;
-  refreshAuthCookie();
+  // As imagens do chat precisam desse cookie; o histórico só é pedido depois dele.
+  authReady = refreshAuthCookie();
+  chats.clear();
+  for (const view of chatViews) view.channelId = null;
   for (const id of state.watching) if (!state.streams.has(id)) state.watching.delete(id);
 
   if (!state.inRoom) enterRoom();
+  else if (state.voice && !state.channels.has(state.voice)) leaveVoice({ notify: false });
   else if (!msg.resumed) {
-    // O servidor esqueceu a gente (reiniciou ou demoramos demais): anuncia de novo o que está no ar.
+    // O servidor esqueceu a gente (reiniciou ou demoramos demais): volta para a sala de voz e anuncia de novo o que está no ar.
+    if (state.voice) send({ type: 'voice:join', channelId: state.voice });
     if (previousId && local.mic) {
       detachMeter(previousId);
       attachMeter(state.me.id, local.mic.stream);
     }
     for (const entry of localEntries()) if (entry.mids.length) announce(entry);
   }
+  const me = state.participants.get(state.me.id);
+  if (me) me.voice = state.voice;
   onUsage(msg.state.usage);
-  onMusic(msg.state.music);
-  renderChat();
+  syncMusic();
   renderFiles();
   renderSoundpad();
   renderAll();
@@ -318,7 +403,7 @@ function onWelcome(msg) {
 function onStreamAdded(stream) {
   const isNew = !state.streams.has(stream.id);
   state.streams.set(stream.id, stream);
-  if (isNew && stream.kind === 'screen' && stream.ownerId !== state.me.id) {
+  if (isNew && stream.kind === 'screen' && stream.ownerId !== state.me.id && inMyVoice(stream.ownerId)) {
     const owner = state.participants.get(stream.ownerId)?.name || 'Alguém';
     if (settings.autoWatch) state.watching.add(stream.id);
     else toast(`${owner} começou a compartilhar (${stream.label})`, { action: 'Assistir', onAction: () => watch(stream.id) });
@@ -345,6 +430,8 @@ function enterRoom() {
   clearInterval(presenceTimer);
   $('#join').hidden = true;
   $('#room').hidden = false;
+  textChat = makeChatView($('#text-chat'));
+  voiceChat = makeChatView($('#voice-chat'));
   setTab(state.tab);
 
   api = new RtcApi(() => `${state.me.id}:${state.me.token}`);
@@ -364,14 +451,73 @@ function enterRoom() {
   $('#files-hint').textContent = `Clique ou arraste aqui. Até ${state.config.fileMaxGB} GB cada; somem em ${state.config.fileTtlHours} h.`;
   new ResizeObserver(layoutGrid).observe($('#grid'));
 
+  // Como no Discord: entra na sala sem estar em nenhuma sala de voz; o microfone liga ao clicar numa.
   if (!state.config.realtimeReady) {
     state.micOn = false;
     sendState();
     toast('Voz e vídeo ainda não foram configurados no servidor.', { timeout: 8000 });
-  } else {
-    if (state.micOn) startMic();
-    if (joinInfo.startCam) startCamera();
   }
+}
+
+// ---------- salas de voz ----------
+
+function inMyVoice(pid) {
+  return !!state.voice && state.participants.get(pid)?.voice === state.voice;
+}
+
+function setMyVoice(id) {
+  const me = state.participants.get(state.me.id);
+  if (me) me.voice = id;
+}
+
+function joinVoice(id) {
+  if (state.channels.get(id)?.kind !== 'voice') return;
+  if (state.voice === id) return showView(id);
+  if (state.voice) stopLocalMedia();
+  state.voice = id;
+  setMyVoice(id);
+  send({ type: 'voice:join', channelId: id });
+  unlockAudio();
+  sound('join');
+  if (state.config.realtimeReady) {
+    if (state.micOn) startMic();
+    if (joinInfo.startCam) {
+      joinInfo.startCam = false;
+      startCamera();
+    }
+  }
+  syncMusic();
+  bindChat(voiceChat, id);
+  reconcile();
+  showView(id);
+}
+
+function leaveVoice({ notify = true } = {}) {
+  if (!state.voice) return;
+  stopLocalMedia();
+  state.voice = null;
+  setMyVoice(null);
+  if (notify) send({ type: 'voice:join', channelId: null });
+  sound('leave');
+  state.watching.clear();
+  state.previewing.clear();
+  state.focusKey = null;
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  toggleSoundpad(false);
+  syncMusic();
+  reconcile();
+  renderAll();
+}
+
+function stopLocalMedia() {
+  const mic = local.mic;
+  if (mic) {
+    local.mic = null;
+    unpublishLocal(mic);
+    detachMeter(state.me.id);
+  }
+  stopCamera();
+  for (const id of [...local.screens.keys()]) stopScreen(id);
 }
 
 function leave() {
@@ -492,18 +638,21 @@ function cameraConstraints() {
 }
 
 async function startMic() {
-  if (local.mic || micStarting || !state.config.realtimeReady) return;
+  if (local.mic || micStarting || !state.config.realtimeReady || !state.voice) return;
   micStarting = true;
+  const voice = state.voice;
   let entry = null;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+    // Saiu da sala de voz enquanto o navegador pedia o microfone.
+    if (state.voice !== voice) return stream.getTracks().forEach((t) => t.stop());
     const track = stream.getAudioTracks()[0];
     track.enabled = state.micOn;
     const id = `mic-${randomId()}`;
     entry = { id, kind: 'mic', label: 'Microfone', stream, items: [{ track, trackName: `${id}:audio` }], mids: [], senders: [] };
     local.mic = entry;
     attachMeter(state.me.id, stream);
-    await publishLocal(entry, () => local.mic === entry);
+    await publishLocal(entry, () => local.mic === entry && state.voice === voice);
   } catch (err) {
     if (entry && local.mic === entry) {
       entry.stream.getTracks().forEach((t) => t.stop());
@@ -548,7 +697,7 @@ function toggleDeafen() {
 }
 
 function applyMic() {
-  if (state.micOn && !local.mic) startMic();
+  if (state.micOn && !local.mic && state.voice) startMic();
   if (local.mic) local.mic.items[0].track.enabled = state.micOn;
   renderControls();
 }
@@ -565,6 +714,7 @@ function sendState() {
   send({ type: 'update', micOn: state.micOn, deafened: state.deafened });
   renderPeople();
   renderStage();
+  renderChannels();
 }
 
 function toggleCamera() {
@@ -573,14 +723,16 @@ function toggleCamera() {
 }
 
 async function startCamera() {
-  if (local.camera || camStarting) return;
+  if (local.camera || camStarting || !state.voice) return;
   if (!state.config.realtimeReady) return toast('Voz e vídeo ainda não foram configurados no servidor.');
   if (state.usage?.blocked) return toast(QUOTA_MSG);
   camStarting = true;
   renderControls();
+  const voice = state.voice;
   let entry = null;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints() });
+    if (state.voice !== voice) return stream.getTracks().forEach((t) => t.stop());
     const track = stream.getVideoTracks()[0];
     const id = `cam-${randomId()}`;
     entry = {
@@ -601,7 +753,7 @@ async function startCamera() {
       })
       .catch(() => {});
     renderStage();
-    await publishLocal(entry, () => local.camera === entry);
+    await publishLocal(entry, () => local.camera === entry && state.voice === voice);
   } catch (err) {
     if (entry && local.camera === entry) {
       entry.stream.getTracks().forEach((t) => t.stop());
@@ -637,6 +789,7 @@ async function flipCamera() {
 }
 
 async function startScreen() {
+  if (!state.voice) return;
   if (!canShareScreen) return toast('Este navegador não deixa compartilhar a tela. Use o app no computador.');
   if (!state.config.realtimeReady) return toast('Voz e vídeo ainda não foram configurados no servidor.');
   if (state.usage?.blocked) return toast(QUOTA_MSG);
@@ -655,6 +808,8 @@ async function startScreen() {
     if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') reportError(err, 'screen', 'o compartilhamento de tela');
     return;
   }
+  if (!state.voice) return stream.getTracks().forEach((t) => t.stop());
+  const voice = state.voice;
   const video = stream.getVideoTracks()[0];
   if ('contentHint' in video) video.contentHint = q.hint;
   const audio = stream.getAudioTracks()[0];
@@ -667,7 +822,7 @@ async function startScreen() {
   video.addEventListener('ended', () => stopScreen(id));
   renderAll();
   try {
-    await publishLocal(entry, () => local.screens.get(id) === entry);
+    await publishLocal(entry, () => local.screens.get(id) === entry && state.voice === voice);
   } catch (err) {
     if (local.screens.get(id) === entry) {
       local.screens.delete(id);
@@ -707,7 +862,7 @@ function unwatch(id) {
 function wantedStreams() {
   const list = [];
   for (const s of state.streams.values()) {
-    if (s.ownerId === state.me?.id || !state.participants.has(s.ownerId)) continue;
+    if (s.ownerId === state.me?.id || !inMyVoice(s.ownerId)) continue;
     if (s.kind === 'screen' && !state.watching.has(s.id)) continue;
     list.push(s);
   }
@@ -1079,7 +1234,7 @@ function screenList() {
   const list = [];
   for (const e of local.screens.values()) list.push({ id: e.id, ownerId: state.me.id, label: e.label, mine: true, starting: e.starting });
   for (const s of state.streams.values()) {
-    if (s.kind === 'screen' && s.ownerId !== state.me?.id && state.participants.has(s.ownerId)) {
+    if (s.kind === 'screen' && s.ownerId !== state.me?.id && inMyVoice(s.ownerId)) {
       list.push({ id: s.id, ownerId: s.ownerId, label: s.label, mine: false });
     }
   }
@@ -1091,16 +1246,38 @@ function initials(name = '?') {
   return ((parts[0]?.[0] || '?') + (parts.length > 1 ? parts.at(-1)[0] : '')).toUpperCase();
 }
 
+// Foto do Discord quando a pessoa entrou por ele; senão (ou se a foto não carregar), as iniciais.
+function paintAvatar(el, { name, color, avatar }) {
+  if (color) el.style.setProperty('--c', color);
+  const key = `${avatar || ''}|${name}`;
+  if (el.dataset.key === key) return;
+  el.dataset.key = key;
+  el.textContent = initials(name);
+  if (!avatar) return;
+  const img = document.createElement('img');
+  img.alt = '';
+  img.referrerPolicy = 'no-referrer';
+  img.addEventListener('error', () => (el.textContent = initials(name)), { once: true });
+  img.src = avatar;
+  el.replaceChildren(img);
+}
+
 // ---------- render ----------
 
 function renderAll() {
   if (!state.inRoom) return;
   renderControls();
   renderPeople();
+  renderView();
   renderStage();
+  renderChannels();
 }
 
 function renderControls() {
+  // Fora de uma sala de voz só ficam microfone e fone (valem para quando entrar numa).
+  const inVoice = !!state.voice;
+  for (const id of ['#btn-cam', '#btn-sounds', '#btn-leave']) $(id).hidden = !inVoice;
+
   const mic = $('#btn-mic');
   mic.innerHTML = icon(state.micOn ? 'mic' : 'mic-off');
   mic.classList.toggle('off', !state.micOn);
@@ -1120,7 +1297,7 @@ function renderControls() {
   cam.title = cam.ariaLabel = local.camera ? 'Desligar a câmera' : 'Ligar a câmera';
 
   const screen = $('#btn-screen');
-  screen.hidden = !canShareScreen;
+  screen.hidden = !canShareScreen || !inVoice;
   screen.innerHTML = icon('screen-share') + (local.screens.size ? `<span class="ctl-count">${local.screens.size}</span>` : '');
   screen.classList.toggle('on', local.screens.size > 0);
   screen.disabled = blocked;
@@ -1141,18 +1318,18 @@ function renderPeople() {
     li.classList.toggle('offline', !p.online);
     li.classList.toggle('expanded', state.expanded === p.id && !mine);
 
-    const status = !p.online
-      ? 'Reconectando…'
-      : [hasCam && 'câmera ligada', screens && `${screens} ${screens > 1 ? 'telas' : 'tela'} ao vivo`].filter(Boolean).join(' · ') ||
-        (p.deafened ? 'Sem ouvir' : p.micOn ? 'Na call' : 'Mutado');
-    const icons = [
-      !p.micOn && icon('mic-off', 'bad'),
-      p.deafened && icon('headphones-off', 'bad'),
-      hasCam && icon('video'),
-      screens && icon('monitor'),
-    ]
-      .filter(Boolean)
-      .join('');
+    const where = p.voice && state.channels.get(p.voice);
+    let status = 'Reconectando…';
+    if (p.online && !where) status = 'Fora das salas de voz';
+    else if (p.online) {
+      const doing = [hasCam && 'câmera ligada', screens && `${screens} ${screens > 1 ? 'telas' : 'tela'} ao vivo`].filter(Boolean).join(' · ');
+      status = `Em ${where.name} · ${doing || (p.deafened ? 'sem ouvir' : p.micOn ? 'na call' : 'mutado')}`;
+    }
+    const icons = where
+      ? [!p.micOn && icon('mic-off', 'bad'), p.deafened && icon('headphones-off', 'bad'), hasCam && icon('video'), screens && icon('monitor')]
+          .filter(Boolean)
+          .join('')
+      : '';
 
     li.innerHTML = `
       <div class="person-row">
@@ -1160,9 +1337,7 @@ function renderPeople() {
         <div class="person-main"><div class="person-name"></div><div class="person-status"></div></div>
         <div class="person-icons">${icons}</div>
       </div>`;
-    const avatar = $('.avatar', li);
-    avatar.textContent = initials(p.name);
-    avatar.style.setProperty('--c', p.color);
+    paintAvatar($('.avatar', li), p);
     $('.person-name', li).textContent = mine ? `${p.name} (você)` : p.name;
     $('.person-status', li).textContent = status;
     if (!mine) {
@@ -1201,7 +1376,7 @@ function tileKeys() {
   for (const s of screenList()) {
     if (s.mine ? state.previewing.has(s.id) : subs.has(s.id)) keys.push(`s:${s.id}`);
   }
-  for (const p of sortedParticipants()) keys.push(`p:${p.id}`);
+  if (state.voice) for (const p of sortedParticipants()) if (p.voice === state.voice) keys.push(`p:${p.id}`);
   return keys;
 }
 
@@ -1291,7 +1466,7 @@ function updateTile(key, tile) {
     const mine = id === state.me.id;
     name = mine ? `${p.name} (você)` : p.name;
     speaker = id;
-    tile.avatar.textContent = initials(p.name);
+    paintAvatar(tile.avatar, p);
     tile.el.style.setProperty('--c', p.color);
     if (mine) {
       stream = local.camera?.stream || null;
@@ -1448,11 +1623,14 @@ function onLivebarClick(event) {
 
 function setTab(tab) {
   state.tab = tab;
-  if (tab === 'chat') state.unread = 0;
+  if (tab === 'chat') {
+    state.unread = 0;
+    if (state.voice) markRead(state.voice);
+  }
   for (const b of $$('.tab')) b.setAttribute('aria-selected', String(b.dataset.tab === tab));
   for (const panel of $$('[data-panel]')) panel.classList.toggle('inactive', panel.dataset.panel !== tab);
   renderBadge();
-  if (tab === 'chat') scrollChat();
+  if (tab === 'chat' && voiceChat) voiceChat.box.scrollTop = voiceChat.box.scrollHeight;
 }
 
 function renderBadge() {
@@ -1461,45 +1639,593 @@ function renderBadge() {
   badge.textContent = state.unread > 9 ? '9+' : state.unread;
 }
 
-function onChat(message) {
-  state.chat.push(message);
-  if (state.chat.length > 200) state.chat.shift();
-  const box = $('#messages');
-  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-  box.append(chatEl(message));
-  if (nearBottom || message.pid === state.me?.id) scrollChat();
-  if (!message.system && message.pid !== state.me?.id && (state.tab !== 'chat' || $('#room').classList.contains('side-hidden'))) {
+// ---------- canais ----------
+
+const chats = new Map(); // id do canal -> { list, loaded, loading, more }
+const chatViews = []; // o canal de texto no meio da tela e o chat da sala de voz, ao lado
+const readUpTo = new Map();
+const INLINE_IMAGE = /^image\/(png|jpeg|gif|webp|avif)$/;
+
+function sortedChannels(kind) {
+  return [...state.channels.values()].filter((c) => c.kind === kind).sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function channelLabel(ch) {
+  return ch.kind === 'text' ? `#${ch.name}` : ch.name;
+}
+
+// O canal de texto aberto (ou a sala de voz em que estou, se foi ela que a pessoa abriu).
+function currentView() {
+  const ch = state.channels.get(state.view);
+  if (ch && (ch.kind === 'text' || ch.id === state.voice)) return ch;
+  return sortedChannels('text')[0];
+}
+
+function showView(id) {
+  state.view = id;
+  if (state.channels.get(id)?.kind === 'text') store.set('view', id);
+  renderAll();
+}
+
+function openChannel(id) {
+  $('#room').classList.remove('channels-open');
+  if (state.channels.get(id)?.kind === 'voice') joinVoice(id);
+  else showView(id);
+}
+
+function renderView() {
+  const ch = currentView();
+  if (!ch || !textChat) return;
+  state.view = ch.id;
+  const voiceView = ch.kind === 'voice';
+  const wasHidden = $('#stage').hidden;
+  $('#stage').hidden = !voiceView;
+  $('#text-view').hidden = voiceView;
+  if (voiceView && wasHidden) requestAnimationFrame(layoutGrid);
+  if (!voiceView) {
+    $('#text-title').textContent = ch.name;
+    if (textChat.channelId !== ch.id) bindChat(textChat, ch.id);
+    if (document.visibilityState === 'visible') markRead(ch.id);
+  }
+  if (state.voice && voiceChat.channelId !== state.voice) bindChat(voiceChat, state.voice);
+  for (const view of chatViews) {
+    const bound = state.channels.get(view.channelId);
+    view.input.placeholder = bound ? `Conversar em ${channelLabel(bound)}` : '';
+  }
+  // O chat ao lado é o da sala de voz: só existe dentro de uma.
+  $('#tab-chat').hidden = !state.voice;
+  if (!state.voice && state.tab === 'chat') setTab('people');
+}
+
+function renderChannels() {
+  if (!state.inRoom) return;
+  const view = currentView();
+  const groups = [
+    ['text', 'Canais de texto'],
+    ['voice', 'Canais de voz'],
+  ].map(([kind, title]) => {
+    const group = document.createElement('div');
+    group.className = 'ch-group';
+    const what = kind === 'voice' ? 'de voz' : 'de texto';
+    group.innerHTML = `<div class="ch-head"><span></span><button class="icon-btn sm" type="button" data-add="${kind}" aria-label="Criar canal ${what}" title="Criar canal ${what}">${icon('plus')}</button></div>`;
+    $('.ch-head span', group).textContent = title;
+    for (const ch of sortedChannels(kind)) {
+      const row = document.createElement('div');
+      row.className = 'ch-row';
+      row.classList.toggle('active', ch.id === view?.id);
+      row.classList.toggle('connected', ch.id === state.voice);
+      row.classList.toggle('unread', kind === 'text' && isUnread(ch));
+      const playing = state.musics.get(ch.id)?.playing ? icon('music', 'ch-music') : '';
+      row.innerHTML = `<button class="ch" type="button" data-channel="${ch.id}">${icon(kind === 'voice' ? 'volume' : 'hash')}<span class="ch-name"></span>${playing}</button><button class="icon-btn sm ch-edit" type="button" data-edit="${ch.id}" aria-label="Editar canal" title="Editar canal">${icon('settings')}</button>`;
+      $('.ch-name', row).textContent = ch.name;
+      group.append(row);
+      if (kind !== 'voice') continue;
+      const members = sortedParticipants().filter((p) => p.voice === ch.id);
+      if (!members.length) continue;
+      const ul = document.createElement('ul');
+      ul.className = 'ch-members';
+      for (const p of members) {
+        const mine = p.id === state.me.id;
+        const li = document.createElement('li');
+        li.className = 'ch-member';
+        li.dataset.speaker = p.id;
+        li.classList.toggle('offline', !p.online);
+        const icons = [
+          (mine ? local.camera : cameraOf(p.id)) && icon('video'),
+          screenCountOf(p.id) && icon('monitor'),
+          !p.micOn && icon('mic-off', 'bad'),
+          p.deafened && icon('headphones-off', 'bad'),
+        ]
+          .filter(Boolean)
+          .join('');
+        li.innerHTML = `<div class="avatar"></div><span class="ch-member-name"></span><span class="ch-member-icons">${icons}</span>`;
+        paintAvatar($('.avatar', li), p);
+        $('.ch-member-name', li).textContent = p.name;
+        ul.append(li);
+      }
+      group.append(ul);
+    }
+    return group;
+  });
+  $('#channel-list').replaceChildren(...groups);
+  const voice = state.channels.get(state.voice);
+  $('#voice-status').hidden = !voice;
+  if (voice) $('#voice-status-name').textContent = voice.name;
+}
+
+function onChannelRemoved(id) {
+  const ch = state.channels.get(id);
+  state.channels.delete(id);
+  state.musics.delete(id);
+  chats.delete(id);
+  for (const view of chatViews) if (view.channelId === id) view.channelId = null;
+  if (state.voice === id) {
+    leaveVoice({ notify: false });
+    toast(`A sala de voz ${ch?.name || ''} foi apagada.`);
+  }
+  renderAll();
+}
+
+// ---------- lidas e não lidas ----------
+
+function readTs(id) {
+  if (!readUpTo.has(id)) readUpTo.set(id, store.get(`read:${id}`, 0));
+  return readUpTo.get(id);
+}
+
+function isUnread(ch) {
+  return ch.lastTs > readTs(ch.id);
+}
+
+function markRead(id) {
+  const ch = state.channels.get(id);
+  if (!ch || readTs(id) >= ch.lastTs) return;
+  readUpTo.set(id, ch.lastTs);
+  store.set(`read:${id}`, ch.lastTs);
+  renderChannels();
+}
+
+function isChatVisible(id) {
+  if (document.visibilityState !== 'visible') return false;
+  if (!$('#text-view').hidden && textChat?.channelId === id) return true;
+  return id === state.voice && state.tab === 'chat' && !$('#room').classList.contains('side-hidden');
+}
+
+// ---------- mensagens ----------
+
+function chatOf(id) {
+  let c = chats.get(id);
+  if (!c) {
+    c = { list: [], loaded: false, loading: false, more: false };
+    chats.set(id, c);
+  }
+  return c;
+}
+
+async function loadHistory(id, before = null) {
+  const c = chatOf(id);
+  if (c.loading) return;
+  c.loading = true;
+  await authReady;
+  send({ type: 'chat:history', channelId: id, before });
+}
+
+function onHistory({ channelId, before, messages, more }) {
+  const c = chats.get(channelId);
+  if (!c) return;
+  c.loading = false;
+  const known = new Set(c.list.map((m) => m.id));
+  c.list = before ? [...messages.filter((m) => !known.has(m.id)), ...c.list] : messages;
+  c.more = more;
+  c.loaded = true;
+  for (const view of chatViews) if (view.channelId === channelId) renderChatView(view, { keepScroll: !!before });
+}
+
+function onChatMessage(m) {
+  const ch = state.channels.get(m.channelId);
+  if (ch) ch.lastTs = m.ts;
+  const c = chats.get(m.channelId);
+  if (c?.loaded) {
+    c.list.push(m);
+    for (const view of chatViews) if (view.channelId === m.channelId) appendChat(view, m);
+  }
+  if (m.pid === state.me?.id || isChatVisible(m.channelId)) markRead(m.channelId);
+  else if (m.channelId === state.voice) {
     state.unread++;
     renderBadge();
   }
+  renderChannels();
 }
 
-function renderChat() {
-  $('#messages').replaceChildren(...state.chat.map(chatEl));
-  scrollChat();
+function onChatDeleted({ channelId, id }) {
+  const c = chats.get(channelId);
+  if (!c) return;
+  c.list = c.list.filter((m) => m.id !== id);
+  for (const view of chatViews) if (view.channelId === channelId) renderChatView(view, { keepScroll: true });
 }
 
-function scrollChat() {
-  const box = $('#messages');
-  box.scrollTop = box.scrollHeight;
+function myAuthor() {
+  return state.me?.author;
 }
 
-function chatEl(m) {
+function fmtWhen(ts) {
+  const d = new Date(ts);
+  const time = d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  const days = Math.round((new Date().setHours(0, 0, 0, 0) - new Date(ts).setHours(0, 0, 0, 0)) / 86_400_000);
+  if (days === 0) return time;
+  if (days === 1) return `ontem às ${time}`;
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return `${d.toLocaleDateString('pt-BR', sameYear ? { day: '2-digit', month: '2-digit' } : undefined)} ${time}`;
+}
+
+function messageEl(m, prev) {
   const el = document.createElement('div');
-  if (m.system) {
-    el.className = 'msg system';
-    el.textContent = m.text;
-    return el;
-  }
   el.className = 'msg';
-  el.innerHTML = `<div class="avatar xs"></div><div class="msg-body"><div class="msg-head"><span class="msg-name"></span><span class="msg-time"></span></div><div class="msg-text"></div></div>`;
-  const avatar = $('.avatar', el);
-  avatar.textContent = initials(m.name);
-  avatar.style.setProperty('--c', m.color);
+  el.dataset.id = m.id;
+  // Mensagens seguidas da mesma pessoa ficam juntas, sem repetir foto e nome.
+  el.classList.toggle('cont', !!prev && prev.author === m.author && m.ts - prev.ts < 5 * 60_000);
+  el.innerHTML = `<div class="avatar xs"></div><div class="msg-body"><div class="msg-head"><span class="msg-name"></span><span class="msg-time"></span></div><div class="msg-text"></div><div class="atts"></div></div>`;
+  paintAvatar($('.avatar', el), m);
   $('.msg-name', el).textContent = m.name;
-  $('.msg-time', el).textContent = new Date(m.ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-  linkify($('.msg-text', el), m.text);
+  $('.msg-time', el).textContent = fmtWhen(m.ts);
+  el.title = new Date(m.ts).toLocaleString('pt-BR', { dateStyle: 'full', timeStyle: 'short' });
+  if (m.text) linkify($('.msg-text', el), m.text);
+  else $('.msg-text', el).remove();
+  const atts = $('.atts', el);
+  for (const a of m.attachments || []) atts.append(attachmentEl(a));
+  if (!atts.children.length) atts.remove();
+  if (m.author === myAuthor()) {
+    el.insertAdjacentHTML('beforeend', `<button class="icon-btn sm msg-del" type="button" data-delete-msg="${m.id}" aria-label="Apagar mensagem" title="Apagar mensagem">${icon('trash')}</button>`);
+  }
   return el;
+}
+
+function attachmentEl(a) {
+  const url = `/api/attachments/${encodeURIComponent(a.id)}`;
+  if (INLINE_IMAGE.test(a.type)) {
+    const img = document.createElement('img');
+    img.className = 'att-img';
+    img.alt = a.name;
+    img.loading = 'lazy';
+    img.dataset.name = a.name;
+    // Com o tamanho conhecido, o espaço já fica reservado e o chat não pula quando a imagem chega.
+    if (a.width && a.height) {
+      const scale = Math.min(1, 400 / a.width, 320 / a.height);
+      img.style.width = `${Math.round(a.width * scale)}px`;
+      img.style.aspectRatio = `${a.width} / ${a.height}`;
+    }
+    img.src = url;
+    return img;
+  }
+  if (/^video\/(mp4|webm)$/.test(a.type)) {
+    const video = document.createElement('video');
+    video.className = 'att-video';
+    video.controls = true;
+    video.preload = 'metadata';
+    video.src = url;
+    return video;
+  }
+  if (/^audio\/(mpeg|ogg|wav|webm|mp4)$/.test(a.type)) {
+    const audio = document.createElement('audio');
+    audio.className = 'att-audio';
+    audio.controls = true;
+    audio.preload = 'metadata';
+    audio.src = url;
+    return audio;
+  }
+  const link = document.createElement('a');
+  link.className = 'att-file';
+  link.href = url;
+  link.download = a.name;
+  link.innerHTML = `${icon('file')}<span class="att-file-main"><span class="att-file-name"></span><span class="att-file-size"></span></span>${icon('download')}`;
+  $('.att-file-name', link).textContent = a.name;
+  $('.att-file-size', link).textContent = fmtBytes(a.size);
+  return link;
+}
+
+// ---------- caixa de mensagens (a mesma para o canal de texto e para o chat da sala de voz) ----------
+
+function makeChatView(root) {
+  root.innerHTML = `
+    <div class="messages"></div>
+    <div class="pending" hidden></div>
+    <div class="chat-status" hidden></div>
+    <form class="inline-form chat-form">
+      <button class="icon-btn attach" type="button" aria-label="Anexar arquivo" title="Anexar arquivo (ou cole uma imagem com Ctrl+V)">${icon('paperclip')}</button>
+      <input type="file" multiple hidden>
+      <input class="input" maxlength="2000" autocomplete="off" aria-label="Mensagem">
+      <button class="btn square" type="submit" aria-label="Enviar">${icon('send')}</button>
+    </form>`;
+  const view = {
+    root,
+    channelId: null,
+    pending: [],
+    sending: false,
+    stick: true,
+    box: $('.messages', root),
+    tray: $('.pending', root),
+    status: $('.chat-status', root),
+    form: $('form', root),
+    input: $('input.input', root),
+    picker: $('input[type="file"]', root),
+  };
+  view.form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    sendChat(view);
+  });
+  view.input.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files || [])];
+    if (!files.length) return;
+    e.preventDefault();
+    addAttachments(view, files);
+  });
+  $('.attach', root).addEventListener('click', () => view.picker.click());
+  view.picker.addEventListener('change', () => {
+    addAttachments(view, [...view.picker.files]);
+    view.picker.value = '';
+  });
+  view.tray.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-remove-pending]');
+    if (!b) return;
+    const item = view.pending.find((p) => p.key === b.dataset.removePending);
+    if (item?.preview) URL.revokeObjectURL(item.preview);
+    view.pending = view.pending.filter((p) => p !== item);
+    renderPending(view);
+  });
+  view.box.addEventListener('scroll', () => {
+    const box = view.box;
+    view.stick = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+    const c = chats.get(view.channelId);
+    if (box.scrollTop < 80 && c?.more && !c.loading) loadHistory(view.channelId, c.list[0]?.id);
+  });
+  // Imagem sem tamanho conhecido terminou de carregar: continua colado no fim.
+  view.box.addEventListener('load', () => view.stick && (view.box.scrollTop = view.box.scrollHeight), true);
+  view.box.addEventListener('click', (e) => {
+    const older = e.target.closest('.load-older');
+    const c = chats.get(view.channelId);
+    if (older && c?.more) loadHistory(view.channelId, c.list[0]?.id);
+    const img = e.target.closest('.att-img');
+    if (img) openLightbox(img);
+    const del = e.target.closest('[data-delete-msg]');
+    if (del && confirm('Apagar esta mensagem? Não dá para desfazer.')) {
+      send({ type: 'chat:delete', channelId: view.channelId, id: del.dataset.deleteMsg });
+    }
+  });
+  chatViews.push(view);
+  return view;
+}
+
+function bindChat(view, id) {
+  view.channelId = id;
+  view.stick = true;
+  const c = chatOf(id);
+  if (!c.loaded) loadHistory(id);
+  renderChatView(view);
+}
+
+function renderChatView(view, { keepScroll = false } = {}) {
+  const box = view.box;
+  const c = chats.get(view.channelId);
+  const ch = state.channels.get(view.channelId);
+  const items = [];
+  if (!c?.loaded) {
+    const note = document.createElement('p');
+    note.className = 'chat-start';
+    note.textContent = 'Carregando…';
+    items.push(note);
+  } else if (c.more) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn secondary small load-older';
+    b.textContent = 'Carregar mensagens antigas';
+    items.push(b);
+  } else {
+    const note = document.createElement('p');
+    note.className = 'chat-start';
+    note.textContent = ch ? `Começo de ${channelLabel(ch)}. Mande mensagens, imagens (dá para colar com Ctrl+V) e arquivos: tudo fica guardado aqui.` : '';
+    items.push(note);
+  }
+  let prev = null;
+  for (const m of c?.list || []) {
+    items.push(messageEl(m, prev));
+    prev = m;
+  }
+  const fromBottom = box.scrollHeight - box.scrollTop;
+  box.replaceChildren(...items);
+  box.scrollTop = keepScroll ? box.scrollHeight - fromBottom : box.scrollHeight;
+}
+
+function appendChat(view, m) {
+  const list = chats.get(view.channelId).list;
+  const box = view.box;
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+  box.append(messageEl(m, list.at(-2)));
+  if (nearBottom || m.pid === state.me?.id) box.scrollTop = box.scrollHeight;
+}
+
+// O chat que recebe um Ctrl+V ou um arquivo solto quando nenhuma caixa de texto está selecionada.
+function activeChatView() {
+  if (!$('#text-view').hidden) return textChat;
+  if (state.voice && state.tab === 'chat' && !$('#room').classList.contains('side-hidden')) return voiceChat;
+  return null;
+}
+
+async function addAttachments(view, files) {
+  if (!view.channelId) return;
+  const max = state.config.chatFileMaxMB;
+  for (const file of files) {
+    if (view.pending.length >= 10) {
+      toast('Dá para mandar até 10 anexos por mensagem.');
+      break;
+    }
+    if (file.size > max * 1e6) {
+      toast(`"${file.name}" passa de ${max} MB, o limite do chat. Mande pela aba Arquivos.`, { timeout: 8000 });
+      continue;
+    }
+    const item = { key: randomId(), file, preview: null, width: 0, height: 0 };
+    if (INLINE_IMAGE.test(file.type)) {
+      item.preview = URL.createObjectURL(file);
+      try {
+        const bitmap = await createImageBitmap(file);
+        item.width = bitmap.width;
+        item.height = bitmap.height;
+        bitmap.close();
+      } catch {
+        // sem o tamanho: a imagem aparece do mesmo jeito, só sem o espaço reservado
+      }
+    }
+    view.pending.push(item);
+  }
+  renderPending(view);
+  view.input.focus();
+}
+
+function renderPending(view) {
+  view.tray.hidden = !view.pending.length;
+  view.tray.replaceChildren(
+    ...view.pending.map((item) => {
+      const el = document.createElement('div');
+      el.className = 'pending-item';
+      el.title = item.file.name;
+      if (item.preview) {
+        const img = document.createElement('img');
+        img.alt = '';
+        img.src = item.preview;
+        el.append(img);
+      } else {
+        el.innerHTML = `${icon('file')}<span></span>`;
+        $('span', el).textContent = item.file.name;
+      }
+      if (!view.sending) el.insertAdjacentHTML('beforeend', `<button type="button" data-remove-pending="${item.key}" aria-label="Tirar anexo">${icon('x')}</button>`);
+      return el;
+    }),
+  );
+}
+
+function setChatStatus(view, text) {
+  view.status.hidden = !text;
+  view.status.textContent = text;
+}
+
+async function sendChat(view) {
+  const text = view.input.value.trim();
+  if (view.sending || !view.channelId || (!text && !view.pending.length)) return;
+  if (ws?.readyState !== WebSocket.OPEN) return toast('Sem conexão com o servidor agora. Tente de novo em instantes.');
+  const channelId = view.channelId;
+  view.sending = true;
+  view.form.querySelectorAll('button, input').forEach((el) => (el.disabled = true));
+  renderPending(view);
+  const ids = [];
+  try {
+    for (const [i, item] of view.pending.entries()) {
+      setChatStatus(view, view.pending.length > 1 ? `Enviando ${i + 1} de ${view.pending.length}…` : 'Enviando…');
+      ids.push((await uploadAttachment(item)).id);
+    }
+    send({ type: 'chat', channelId, text, attachments: ids });
+    for (const item of view.pending) if (item.preview) URL.revokeObjectURL(item.preview);
+    view.pending = [];
+    view.input.value = '';
+  } catch (err) {
+    reportError(err, 'file', 'o anexo');
+  } finally {
+    view.sending = false;
+    view.form.querySelectorAll('button, input').forEach((el) => (el.disabled = false));
+    setChatStatus(view, '');
+    renderPending(view);
+    view.input.focus();
+  }
+}
+
+async function uploadAttachment(item) {
+  const headers = {
+    Authorization: authHeader(),
+    'Content-Type': 'application/octet-stream',
+    'X-File-Name': encodeURIComponent(item.file.name || 'imagem.png'),
+    'X-File-Type': encodeURIComponent(item.file.type || ''),
+  };
+  if (item.width) Object.assign(headers, { 'X-Width': String(item.width), 'X-Height': String(item.height) });
+  let res;
+  try {
+    res = await fetch('/api/attachments', { method: 'POST', headers, body: item.file });
+  } catch {
+    throw Object.assign(new Error('Sem conexão com o servidor da sala'), { code: 'network' });
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(data.errorDescription || `Erro ${res.status}`), { code: data.errorCode || `http_${res.status}` });
+  return data;
+}
+
+function openLightbox(img) {
+  const box = $('#lightbox');
+  $('img', box).src = img.src;
+  $('img', box).alt = img.alt;
+  const link = $('.lightbox-link', box);
+  link.href = img.src;
+  link.download = img.dataset.name || '';
+  box.showModal();
+}
+
+// ---------- criar, renomear e apagar canais ----------
+
+let channelEditing = null;
+
+function openChannelDialog({ kind, channel }) {
+  channelEditing = channel ? { id: channel.id } : { kind };
+  const what = (channel?.kind || kind) === 'voice' ? 'de voz' : 'de texto';
+  $('#channel-title').textContent = channel ? `Editar canal ${what}` : `Criar canal ${what}`;
+  $('#channel-name').value = channel?.name || '';
+  $('#channel-name').placeholder = (channel?.kind || kind) === 'voice' ? 'Ex.: Duo, Flex, Resenha' : 'Ex.: comps, prints, memes';
+  $('#channel-save').textContent = channel ? 'Salvar' : 'Criar canal';
+  $('#channel-delete').hidden = !channel;
+  $('#channel-dialog').showModal();
+  $('#channel-name').focus();
+}
+
+function bindChannels() {
+  $('#channel-list').addEventListener('click', (e) => {
+    const open = e.target.closest('[data-channel]');
+    if (open) return openChannel(open.dataset.channel);
+    const add = e.target.closest('[data-add]');
+    if (add) return openChannelDialog({ kind: add.dataset.add });
+    const edit = e.target.closest('[data-edit]');
+    if (edit) openChannelDialog({ channel: state.channels.get(edit.dataset.edit) });
+  });
+  $('#channel-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = $('#channel-name').value.trim();
+    if (!name) return;
+    if (channelEditing.id) send({ type: 'channel:update', id: channelEditing.id, name });
+    else send({ type: 'channel:create', kind: channelEditing.kind, name });
+    $('#channel-dialog').close();
+  });
+  $('#channel-cancel').addEventListener('click', () => $('#channel-dialog').close());
+  $('#channel-delete').addEventListener('click', () => {
+    const ch = state.channels.get(channelEditing.id);
+    if (!ch) return $('#channel-dialog').close();
+    const extra = ch.kind === 'text' ? ' e todas as mensagens e imagens dele' : ' e o chat dela';
+    if (!confirm(`Apagar ${channelLabel(ch)}${extra}? Não dá para desfazer.`)) return;
+    send({ type: 'channel:delete', id: ch.id });
+    $('#channel-dialog').close();
+  });
+  $('#voice-status-leave').addEventListener('click', () => leaveVoice());
+  $('#btn-channels').addEventListener('click', () => $('#room').classList.toggle('channels-open'));
+  $('#channels-backdrop').addEventListener('click', () => $('#room').classList.remove('channels-open'));
+  $('#lightbox').addEventListener('click', (e) => {
+    if (!e.target.closest('.lightbox-link')) $('#lightbox').close();
+  });
+  // Ctrl+V com uma imagem copiada, sem precisar clicar na caixa de mensagem antes.
+  document.addEventListener('paste', (e) => {
+    if (!state.inRoom || e.target.closest?.('input, textarea, [contenteditable]')) return;
+    const view = activeChatView();
+    const files = [...(e.clipboardData?.files || [])];
+    if (!view || !files.length) return;
+    e.preventDefault();
+    addAttachments(view, files);
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !state.inRoom) return;
+    for (const view of chatViews) if (view.channelId && isChatVisible(view.channelId)) markRead(view.channelId);
+  });
 }
 
 function linkify(el, text) {
@@ -1519,18 +2245,32 @@ function linkify(el, text) {
 
 // ---------- música ----------
 
-function onMusic(m) {
-  state.music = m;
-  music?.setState(m);
+function onMusic(channelId, m) {
+  state.musics.set(channelId, m);
+  if (channelId === state.voice) syncMusic();
+  renderChannels();
+}
+
+// Cada sala de voz tem a sua música; o player toca a da sala em que estou (nenhuma, fora delas).
+function syncMusic() {
+  state.music = (state.voice && state.musics.get(state.voice)) || null;
+  music?.setState(state.music);
   renderMusic();
 }
 
 function renderMusic() {
   const m = state.music;
   const current = m?.current;
-  $('#np-title').textContent = current ? current.title : 'Nada tocando';
-  $('#np-by').textContent = current ? `colocada por ${current.by}` : 'Cole um link do YouTube aqui embaixo para começar.';
+  const inVoice = !!state.voice;
+  $('#np-title').textContent = current ? current.title : inVoice ? 'Nada tocando' : 'Fora das salas de voz';
+  $('#np-by').textContent = current
+    ? `colocada por ${current.by}`
+    : inVoice
+      ? 'Cole um link do YouTube aqui embaixo para começar.'
+      : 'Entre numa sala de voz para ouvir e colocar música. Cada sala tem a sua.';
   $('#yt-empty').hidden = !!current;
+  $('#music-url').disabled = !inVoice;
+  $('#music-form button').disabled = !inVoice;
   for (const button of [$('#music-toggle'), $('#mini-toggle')]) {
     button.innerHTML = icon(m?.playing ? 'pause' : 'play');
     button.disabled = !current;
@@ -1597,7 +2337,7 @@ function authHeader() {
 
 // O download é um link comum, então a autorização vai num cookie.
 function refreshAuthCookie() {
-  fetch('/api/auth-cookie', { method: 'POST', headers: { Authorization: authHeader() } }).catch(() => {});
+  return fetch('/api/auth-cookie', { method: 'POST', headers: { Authorization: authHeader() } }).catch(() => {});
 }
 
 async function filesApi(method, path, body) {
@@ -1782,15 +2522,21 @@ function bindFiles() {
   document.addEventListener('dragleave', () => {
     if (dragDepth && --dragDepth === 0) $('#drop-overlay').hidden = true;
   });
+  // Solto em cima de um chat vira anexo da mensagem; em qualquer outro lugar vai para a aba Arquivos.
+  const chatUnder = (e) => chatViews.find((view) => view.channelId && view.root.contains(e.target));
   document.addEventListener('dragover', (e) => {
-    if (state.inRoom && hasFiles(e)) e.preventDefault();
+    if (!state.inRoom || !hasFiles(e)) return;
+    e.preventDefault();
+    $('#drop-overlay > div').textContent = chatUnder(e) ? 'Solte para anexar na mensagem' : 'Solte para enviar à aba Arquivos';
   });
   document.addEventListener('drop', (e) => {
     if (!state.inRoom || !hasFiles(e)) return;
     e.preventDefault();
     dragDepth = 0;
     $('#drop-overlay').hidden = true;
-    uploadFiles([...e.dataTransfer.files]);
+    const view = chatUnder(e);
+    if (view) addAttachments(view, [...e.dataTransfer.files]);
+    else uploadFiles([...e.dataTransfer.files]);
   });
 }
 
@@ -1840,7 +2586,7 @@ async function playSound(sound, by) {
 function clickSound(id) {
   const sound = state.sounds.find((s) => s.id === id);
   const now = Date.now();
-  if (!sound || now - lastSoundAt < 400) return;
+  if (!sound || !state.voice || now - lastSoundAt < 400) return;
   lastSoundAt = now;
   playSound(sound, null);
   send({ type: 'sound:play', id });
@@ -2036,6 +2782,8 @@ function bindSettings() {
     if (!name) return;
     store.set('name', name);
     if (joinInfo) joinInfo.name = name;
+    // Sem Discord, quem escreveu é reconhecido pelo nome.
+    if (state.me?.author?.startsWith('n:')) state.me.author = `n:${name.toLowerCase()}`;
     send({ type: 'update', name });
   });
   $('#set-mic').addEventListener('change', async (e) => {
@@ -2101,7 +2849,8 @@ function bindRoomUi() {
   $('#btn-deafen').addEventListener('click', toggleDeafen);
   $('#btn-cam').addEventListener('click', toggleCamera);
   $('#btn-screen').addEventListener('click', startScreen);
-  $('#btn-leave').addEventListener('click', leave);
+  $('#btn-leave').addEventListener('click', () => leaveVoice());
+  $('#btn-exit').addEventListener('click', leave);
   $('#btn-settings').addEventListener('click', openSettings);
   $('#btn-side').addEventListener('click', () => {
     const hidden = $('#room').classList.toggle('side-hidden');
@@ -2117,15 +2866,8 @@ function bindRoomUi() {
   $('#livebar').addEventListener('click', onLivebarClick);
   $('#people').addEventListener('click', onPeopleClick);
   $('#people').addEventListener('input', onPeopleInput);
+  bindChannels();
 
-  $('#chat-form').addEventListener('submit', (e) => {
-    e.preventDefault();
-    const input = $('#chat-input');
-    const text = input.value.trim();
-    if (!text) return;
-    send({ type: 'chat', text });
-    input.value = '';
-  });
   $('#music-form').addEventListener('submit', (e) => {
     e.preventDefault();
     const input = $('#music-url');

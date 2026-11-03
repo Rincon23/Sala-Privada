@@ -1,9 +1,9 @@
 // Servidor da Sala Privada: entrega o site, faz a sinalização por WebSocket
 // (quem está na sala, o que está no ar, chat, música e arquivos) e repassa as
 // chamadas para o Cloudflare Realtime. O segredo do app do Realtime nunca sai daqui.
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { mkdir, readdir, readFile, statfs, truncate, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readdir, readFile, statfs, truncate, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { Transform } from 'node:stream';
@@ -17,6 +17,10 @@ const PORT = Number(process.env.PORT) || 8380;
 const APP_ID = (process.env.REALTIME_APP_ID || '').trim();
 const APP_SECRET = (process.env.REALTIME_APP_SECRET || '').trim();
 const ROOM_PASSWORD = process.env.ROOM_PASSWORD || '';
+const DISCORD_ID = (process.env.DISCORD_CLIENT_ID || '').trim();
+const DISCORD_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
+const DISCORD_API = 'https://discord.com/api/v10';
+const DISCORD_DAYS = 30;
 const LIMIT_GB = Number(process.env.MONTHLY_LIMIT_GB) || 900;
 const FILE_TTL_HOURS = Number(process.env.FILE_TTL_HOURS) || 24;
 const FILE_MAX_GB = Number(process.env.FILE_MAX_GB) || 10;
@@ -29,6 +33,17 @@ const SOUNDS_DIR = path.join(DATA_DIR, 'sounds');
 const SOUNDS_INDEX = path.join(DATA_DIR, 'sounds.json');
 const SOUND_MAX_BYTES = 2 * 1024 * 1024;
 const SOUNDS_MAX = 200;
+const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
+const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
+const ATTACH_DIR = path.join(DATA_DIR, 'attachments');
+const CHAT_FILE_MAX_MB = Number(process.env.CHAT_FILE_MAX_MB) || 25;
+const CHANNELS_MAX = 50;
+const HISTORY_PAGE = 50;
+// Anexos que o navegador mostra direto no chat; o resto só baixa (um HTML ou SVG aberto aqui rodaria código no site).
+const INLINE_TYPES = new Set([
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
+  'video/mp4', 'video/webm', 'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/webm', 'audio/mp4',
+]);
 // Sons que já vêm na mesa (gerados por scripts/make-sounds.mjs).
 const DEFAULT_SOUNDS = [
   ['corneta', 'Corneta', '📯'],
@@ -170,21 +185,34 @@ const sessions = new Map(); // sessionId do Realtime -> id do participante dono
 const stallReports = new Map(); // id da transmissão -> Map(id de quem reclamou -> quando)
 const files = new Map();
 const sounds = new Map();
-const chat = [];
-const music = { queue: [], current: null, playing: false, position: 0, since: Date.now() };
+const channels = new Map(); // id -> { id, kind: 'text' | 'voice', name, createdAt, createdBy }
+const messages = new Map(); // id do canal -> mensagens em ordem (ficam salvas em data/messages)
+const attachments = new Map(); // id do anexo -> dados, só dos que já estão numa mensagem
+const pendingUploads = new Map(); // anexos enviados que ainda não foram para nenhuma mensagem
+const musics = new Map(); // id da sala de voz -> música tocando nela
 let usage = { month: monthKey(), bytes: 0 };
 let usageDirty = false;
 
 function publicParticipant(p) {
-  return { id: p.id, name: p.name, color: p.color, micOn: p.micOn, deafened: p.deafened, online: p.online, joinedAt: p.joinedAt };
+  return {
+    id: p.id,
+    name: p.name,
+    color: p.color,
+    avatar: p.avatar,
+    voice: p.voice,
+    micOn: p.micOn,
+    deafened: p.deafened,
+    online: p.online,
+    joinedAt: p.joinedAt,
+  };
 }
 
 function snapshot() {
   return {
     participants: [...participants.values()].map(publicParticipant),
     streams: [...streams.values()],
-    chat: chat.slice(-80),
-    music: musicState(),
+    channels: [...channels.values()].map(publicChannel),
+    musics: Object.fromEntries([...musics].map(([id, m]) => [id, musicState(m)])),
     usage: usageInfo(),
     files: [...files.values()].filter((f) => f.complete).map(publicFile),
     sounds: allSounds(),
@@ -202,6 +230,14 @@ function broadcast(msg, exceptId) {
   }
 }
 
+// Só para quem está naquela sala de voz.
+function broadcastVoice(channelId, msg, exceptId) {
+  const data = JSON.stringify(msg);
+  for (const p of participants.values()) {
+    if (p.voice === channelId && p.id !== exceptId && p.ws?.readyState === 1) p.ws.send(data);
+  }
+}
+
 function cleanName(name) {
   return String(name ?? '').replace(/\s+/g, ' ').trim().slice(0, 32);
 }
@@ -214,14 +250,9 @@ function colorFor(name) {
   return COLORS[hash % COLORS.length];
 }
 
-function pushChat(entry) {
-  chat.push(entry);
-  if (chat.length > 150) chat.shift();
-  broadcast({ type: 'chat', message: entry });
-}
-
-function systemChat(text) {
-  pushChat({ id: newId(), system: true, text, ts: Date.now() });
+// Quem escreveu, de um jeito que sobrevive a reconexões: a conta do Discord, ou o nome.
+function authorKey(p) {
+  return p.discordId ? `d:${p.discordId}` : `n:${p.name.toLowerCase()}`;
 }
 
 function describeStream(s) {
@@ -251,7 +282,7 @@ function handleJoin(ws, msg) {
   if (ROOM_PASSWORD && msg.password !== ROOM_PASSWORD) {
     return send(ws, { type: 'error', code: 'password', message: 'Senha incorreta.' });
   }
-  const name = cleanName(msg.name);
+  const name = cleanName(msg.name) || ws.discord?.name;
   if (!name) return send(ws, { type: 'error', code: 'name', message: 'Escolha um nome.' });
 
   let p = msg.resume ? participants.get(msg.resume.id) : null;
@@ -261,18 +292,20 @@ function handleJoin(ws, msg) {
     p.leaveTimer = null;
     if (p.ws && p.ws !== ws) p.ws.close();
   } else {
-    p = { id: newId(), token: newId(18), name, color: colorFor(name), joinedAt: Date.now() };
+    p = { id: newId(), token: newId(18), name, color: colorFor(name), voice: null, joinedAt: Date.now() };
     participants.set(p.id, p);
   }
   p.ws = ws;
   p.online = true;
   p.name = name;
+  p.avatar = ws.discord?.avatar || null;
+  p.discordId = ws.discord?.id || null;
   p.device = ws.device;
   p.micOn = !!msg.micOn;
   p.deafened = !!msg.deafened;
   ws.pid = p.id;
 
-  send(ws, { type: 'welcome', resumed, version: APP_VERSION, you: { id: p.id, token: p.token }, state: snapshot() });
+  send(ws, { type: 'welcome', resumed, version: APP_VERSION, you: { id: p.id, token: p.token, author: authorKey(p) }, state: snapshot() });
   if (msg.version !== APP_VERSION) {
     log(
       'AVISO',
@@ -289,8 +322,8 @@ function handleJoin(ws, msg) {
     log('INFO', who(p), 'reconectou ao servidor');
   } else {
     broadcast({ type: 'participant:joined', participant: publicParticipant(p) }, p.id);
-    systemChat(`${p.name} entrou`);
-    log('INFO', who(p), `entrou na sala (${participants.size} ${participants.size === 1 ? 'pessoa' : 'pessoas'} agora)`);
+    const via = ws.discord ? ` com o Discord (@${ws.discord.username})` : '';
+    log('INFO', who(p), `entrou na sala${via} (${participants.size} ${participants.size === 1 ? 'pessoa' : 'pessoas'} agora)`);
   }
 }
 
@@ -313,47 +346,82 @@ function removeParticipant(p) {
   if (participants.get(p.id) !== p) return;
   clearTimeout(p.leaveTimer);
   participants.delete(p.id);
+  dropStreams(p);
+  for (const [sid, owner] of sessions) if (owner === p.id) sessions.delete(sid);
+  broadcast({ type: 'participant:left', id: p.id });
+  log('INFO', who(p), 'saiu da sala');
+  if (p.voice) pauseIfEmpty(p.voice);
+}
+
+function dropStreams(p) {
   for (const s of [...streams.values()]) {
     if (s.ownerId !== p.id) continue;
     streams.delete(s.id);
     broadcast({ type: 'stream:removed', id: s.id });
   }
-  for (const [sid, owner] of sessions) if (owner === p.id) sessions.delete(sid);
-  broadcast({ type: 'participant:left', id: p.id });
-  systemChat(`${p.name} saiu`);
-  log('INFO', who(p), 'saiu da sala');
-  // Sala vazia: pausa a música para ela não "andar sozinha".
-  if (!participants.size && music.playing) setPlaying(false);
 }
 
-// ---------- música ----------
-
-function musicPosition() {
-  return music.playing ? music.position + (Date.now() - music.since) / 1000 : music.position;
+function voiceMembers(channelId) {
+  return [...participants.values()].filter((p) => p.voice === channelId);
 }
 
-function musicState() {
-  return { queue: music.queue, current: music.current, playing: music.playing, position: musicPosition(), serverTime: Date.now() };
+// Entra numa sala de voz (ou sai, com null). O que a pessoa transmitia na sala anterior acaba.
+function moveVoice(p, channelId) {
+  const from = p.voice;
+  if (from === channelId) return;
+  p.voice = channelId;
+  dropStreams(p);
+  broadcast({ type: 'participant:updated', participant: publicParticipant(p) });
+  if (channelId) log('INFO', who(p), `entrou na sala de voz "${channels.get(channelId).name}"`);
+  if (from) pauseIfEmpty(from);
 }
 
-function broadcastMusic() {
-  broadcast({ type: 'music', music: musicState() });
+// Sala de voz vazia: pausa a música para ela não "andar sozinha".
+function pauseIfEmpty(channelId) {
+  const m = musics.get(channelId);
+  if (m?.playing && !voiceMembers(channelId).length) setPlaying(channelId, false);
 }
 
-function playItem(item) {
-  music.current = item || null;
-  music.position = 0;
-  music.since = Date.now();
-  music.playing = !!item;
-  broadcastMusic();
+// ---------- música (cada sala de voz tem a sua) ----------
+
+function musicOf(channelId) {
+  let m = musics.get(channelId);
+  if (!m) {
+    m = { queue: [], current: null, playing: false, position: 0, since: Date.now() };
+    musics.set(channelId, m);
+  }
+  return m;
 }
 
-function setPlaying(playing) {
-  if (!music.current) return;
-  music.position = musicPosition();
-  music.since = Date.now();
-  music.playing = playing;
-  broadcastMusic();
+function musicPosition(m) {
+  return m.playing ? m.position + (Date.now() - m.since) / 1000 : m.position;
+}
+
+function musicState(m) {
+  return { queue: m.queue, current: m.current, playing: m.playing, position: musicPosition(m), serverTime: Date.now() };
+}
+
+// Vai para todo mundo: a lista de canais mostra onde tem música tocando.
+function broadcastMusic(channelId) {
+  broadcast({ type: 'music', channelId, music: musicState(musicOf(channelId)) });
+}
+
+function playItem(channelId, item) {
+  const m = musicOf(channelId);
+  m.current = item || null;
+  m.position = 0;
+  m.since = Date.now();
+  m.playing = !!item;
+  broadcastMusic(channelId);
+}
+
+function setPlaying(channelId, playing) {
+  const m = musicOf(channelId);
+  if (!m.current) return;
+  m.position = musicPosition(m);
+  m.since = Date.now();
+  m.playing = playing;
+  broadcastMusic(channelId);
 }
 
 function parseYouTubeId(input) {
@@ -536,6 +604,128 @@ async function loadSounds() {
   }
 }
 
+// ---------- canais de texto e de voz ----------
+// Os canais e as mensagens ficam no disco (data/channels.json e data/messages/<canal>.jsonl,
+// uma mensagem por linha). Os anexos ficam em data/attachments e só somem se a mensagem for apagada.
+
+function publicChannel(c) {
+  return { id: c.id, kind: c.kind, name: c.name, createdAt: c.createdAt, lastTs: messages.get(c.id)?.at(-1)?.ts || 0 };
+}
+
+const messagesFile = (channelId) => path.join(MESSAGES_DIR, `${channelId}.jsonl`);
+const attachPath = (id) => path.join(ATTACH_DIR, id);
+
+// Gravações no disco uma de cada vez, para uma não atropelar a outra.
+let diskQueue = Promise.resolve();
+
+function onDisk(what, task) {
+  diskQueue = diskQueue
+    .then(task)
+    .catch((err) => log('ERRO', null, `não consegui salvar ${what} (${err.message})`, 'confira o espaço em disco do servidor e se o volume /data existe'));
+  return diskQueue;
+}
+
+function saveChannels() {
+  return onDisk('a lista de canais', () => writeFile(CHANNELS_FILE, JSON.stringify([...channels.values()])));
+}
+
+function rewriteMessages(channelId) {
+  const lines = (messages.get(channelId) || []).map((m) => `${JSON.stringify(m)}\n`).join('');
+  return onDisk('as mensagens', () => writeFile(messagesFile(channelId), lines));
+}
+
+async function loadChannels() {
+  await mkdir(MESSAGES_DIR, { recursive: true });
+  await mkdir(ATTACH_DIR, { recursive: true });
+  try {
+    for (const c of JSON.parse(await readFile(CHANNELS_FILE, 'utf8'))) {
+      if (/^[\w-]{1,32}$/.test(c.id) && (c.kind === 'text' || c.kind === 'voice')) channels.set(c.id, c);
+    }
+  } catch {
+    // primeira vez: cria os canais padrão logo abaixo
+  }
+  for (const [kind, name] of [['text', 'geral'], ['voice', 'Geral']]) {
+    if ([...channels.values()].some((c) => c.kind === kind)) continue;
+    const c = { id: newId(), kind, name, createdAt: Date.now(), createdBy: null };
+    channels.set(c.id, c);
+  }
+  await saveChannels();
+  for (const c of channels.values()) {
+    const list = [];
+    try {
+      for (const line of (await readFile(messagesFile(c.id), 'utf8')).split('\n')) {
+        if (!line) continue;
+        try {
+          list.push(JSON.parse(line));
+        } catch {
+          // linha cortada por um desligamento no meio da gravação
+        }
+      }
+    } catch {
+      // canal ainda sem mensagens
+    }
+    messages.set(c.id, list);
+    for (const m of list) for (const a of m.attachments || []) attachments.set(a.id, a);
+  }
+  // Sobras de canais apagados e de envios que não viraram mensagem.
+  for (const name of await readdir(MESSAGES_DIR)) {
+    if (!channels.has(name.replace(/\.jsonl$/, ''))) await unlink(path.join(MESSAGES_DIR, name)).catch(() => {});
+  }
+  for (const name of await readdir(ATTACH_DIR)) {
+    if (!attachments.has(name)) await unlink(attachPath(name)).catch(() => {});
+  }
+}
+
+function addMessage(m) {
+  messages.get(m.channelId).push(m);
+  for (const a of m.attachments) attachments.set(a.id, a);
+  broadcast({ type: 'chat', message: m });
+  onDisk('uma mensagem', () => appendFile(messagesFile(m.channelId), `${JSON.stringify(m)}\n`));
+}
+
+function deleteMessage(channelId, index) {
+  const [m] = messages.get(channelId).splice(index, 1);
+  for (const a of m.attachments) attachments.delete(a.id);
+  broadcast({ type: 'chat:deleted', channelId, id: m.id });
+  rewriteMessages(channelId);
+  onDisk('a remoção dos anexos', async () => {
+    for (const a of m.attachments) await unlink(attachPath(a.id)).catch(() => {});
+  });
+}
+
+function deleteChannel(c) {
+  for (const member of voiceMembers(c.id)) moveVoice(member, null);
+  const list = messages.get(c.id) || [];
+  musics.delete(c.id);
+  messages.delete(c.id);
+  channels.delete(c.id);
+  for (const m of list) for (const a of m.attachments || []) attachments.delete(a.id);
+  broadcast({ type: 'channel:removed', id: c.id });
+  saveChannels();
+  onDisk('a remoção do canal', async () => {
+    await unlink(messagesFile(c.id)).catch(() => {});
+    for (const m of list) for (const a of m.attachments || []) await unlink(attachPath(a.id)).catch(() => {});
+  });
+  return list.length;
+}
+
+// Anexo enviado mas nunca mandado numa mensagem (a pessoa desistiu): some depois de 1 h.
+function sweepUploads() {
+  const cutoff = Date.now() - 60 * 60_000;
+  for (const [id, up] of pendingUploads) {
+    if (up.createdAt > cutoff) continue;
+    pendingUploads.delete(id);
+    onDisk('a limpeza de anexos', () => unlink(attachPath(id)).catch(() => {}));
+  }
+}
+
+// Só dá para receber o que é transmitido na mesma sala de voz.
+function sameVoice(p, trackName) {
+  const s = streams.get(String(trackName || '').split(':')[0]);
+  if (!s) return true; // já acabou: o Cloudflare responde que não existe
+  return !!p.voice && participants.get(s.ownerId)?.voice === p.voice;
+}
+
 // ---------- mensagens do WebSocket ----------
 
 function validStream(s) {
@@ -553,17 +743,53 @@ const handlers = {
     if (typeof msg.deafened === 'boolean') p.deafened = msg.deafened;
     if (msg.name !== undefined) {
       const name = cleanName(msg.name);
-      if (name && name !== p.name) {
-        systemChat(`${p.name} agora se chama ${name}`);
-        p.name = name;
-      }
+      if (name) p.name = name;
     }
     broadcast({ type: 'participant:updated', participant: publicParticipant(p) });
   },
 
+  'voice:join'(p, msg) {
+    const id = msg.channelId ? String(msg.channelId) : null;
+    if (id && channels.get(id)?.kind !== 'voice') return send(p.ws, { type: 'voice:ended', text: 'Essa sala de voz não existe mais.' });
+    moveVoice(p, id);
+  },
+
+  'channel:create'(p, msg) {
+    const kind = msg.kind === 'voice' ? 'voice' : 'text';
+    const name = cleanName(msg.name);
+    if (!name) return;
+    if (channels.size >= CHANNELS_MAX) return send(p.ws, { type: 'notice', text: `Já são ${CHANNELS_MAX} canais. Apague algum antes.` });
+    const c = { id: newId(), kind, name, createdAt: Date.now(), createdBy: p.name };
+    channels.set(c.id, c);
+    messages.set(c.id, []);
+    saveChannels();
+    broadcast({ type: 'channel:added', channel: publicChannel(c), by: p.id });
+    log('INFO', who(p), `criou o canal de ${kind === 'voice' ? 'voz' : 'texto'} "${name}"`);
+  },
+
+  'channel:update'(p, msg) {
+    const c = channels.get(String(msg.id ?? ''));
+    const name = cleanName(msg.name);
+    if (!c || !name || name === c.name) return;
+    log('INFO', who(p), `renomeou o canal "${c.name}" para "${name}"`);
+    c.name = name;
+    saveChannels();
+    broadcast({ type: 'channel:updated', channel: publicChannel(c) });
+  },
+
+  'channel:delete'(p, msg) {
+    const c = channels.get(String(msg.id ?? ''));
+    if (!c) return;
+    if ([...channels.values()].filter((x) => x.kind === c.kind).length <= 1) {
+      return send(p.ws, { type: 'notice', text: `Precisa sobrar pelo menos um canal de ${c.kind === 'voice' ? 'voz' : 'texto'}.` });
+    }
+    const count = deleteChannel(c);
+    log('AVISO', who(p), `apagou o canal "${c.name}"${count ? ` e as ${count} mensagens dele` : ''}`);
+  },
+
   'stream:publish'(p, msg) {
     const s = validStream(msg.stream);
-    if (!s) return;
+    if (!s || !p.voice) return;
     const owner = sessions.get(s.sessionId);
     if (owner && owner !== p.id) return;
     const existing = streams.get(s.id);
@@ -617,79 +843,122 @@ const handlers = {
     log('ERRO', who(p), `${text}${extra}`, clip(msg.action, 300), `${p.id}|client|${code}|${clip(msg.what, 20)}`);
   },
 
-  // Quem clicou já tocou na hora; os outros recebem o aviso para tocar também.
+  // Quem clicou já tocou na hora; os outros da mesma sala de voz recebem o aviso para tocar também.
   'sound:play'(p, msg) {
     const id = String(msg.id ?? '');
-    if (!DEFAULT_SOUNDS.some((s) => s.id === id) && !sounds.has(id)) return;
+    if (!p.voice || (!DEFAULT_SOUNDS.some((s) => s.id === id) && !sounds.has(id))) return;
     const now = Date.now();
     if (now - (p.lastSound || 0) < 400) return;
     p.lastSound = now;
-    broadcast({ type: 'sound:play', id, by: p.name }, p.id);
+    broadcastVoice(p.voice, { type: 'sound:play', id, by: p.name }, p.id);
   },
 
   chat(p, msg) {
-    const text = String(msg.text ?? '').trim().slice(0, 1000);
-    if (text) pushChat({ id: newId(), pid: p.id, name: p.name, color: p.color, text, ts: Date.now() });
+    const channel = channels.get(String(msg.channelId ?? ''));
+    if (!channel) return;
+    const text = String(msg.text ?? '').trim().slice(0, 2000);
+    const author = authorKey(p);
+    const list = [];
+    for (const id of Array.isArray(msg.attachments) ? msg.attachments.slice(0, 10) : []) {
+      const up = pendingUploads.get(String(id));
+      if (!up || up.author !== author) continue;
+      pendingUploads.delete(up.meta.id);
+      list.push(up.meta);
+    }
+    if (!text && !list.length) return;
+    addMessage({ id: newId(), channelId: channel.id, pid: p.id, author, name: p.name, color: p.color, avatar: p.avatar, text, attachments: list, ts: Date.now() });
+  },
+
+  'chat:delete'(p, msg) {
+    const channelId = String(msg.channelId ?? '');
+    const list = messages.get(channelId);
+    const i = list ? list.findIndex((m) => m.id === msg.id) : -1;
+    if (i < 0) return;
+    if (list[i].author !== authorKey(p)) return send(p.ws, { type: 'notice', text: 'Só quem mandou pode apagar a mensagem.' });
+    deleteMessage(channelId, i);
+  },
+
+  // O histórico vem em páginas, das mais novas para as mais antigas.
+  'chat:history'(p, msg) {
+    const channelId = String(msg.channelId ?? '');
+    const list = messages.get(channelId);
+    if (!list) return;
+    let end = list.length;
+    if (msg.before) {
+      const i = list.findIndex((m) => m.id === msg.before);
+      if (i >= 0) end = i;
+    }
+    const start = Math.max(0, end - HISTORY_PAGE);
+    send(p.ws, { type: 'chat:history', channelId, before: msg.before || null, messages: list.slice(start, end), more: start > 0 });
   },
 
   async 'music:add'(p, msg) {
+    const channelId = p.voice;
+    if (!channelId) return send(p.ws, { type: 'notice', text: 'Entre numa sala de voz para colocar música.' });
     const videoId = parseYouTubeId(String(msg.url ?? ''));
     if (!videoId) return send(p.ws, { type: 'notice', text: 'Esse link não parece ser do YouTube.' });
-    if (music.queue.length >= 100) return send(p.ws, { type: 'notice', text: 'A fila está cheia.' });
+    if (musicOf(channelId).queue.length >= 100) return send(p.ws, { type: 'notice', text: 'A fila está cheia.' });
     const info = await videoInfo(videoId);
     if (info.error) return send(p.ws, { type: 'notice', text: info.error });
+    if (!channels.has(channelId)) return; // a sala foi apagada enquanto o YouTube respondia
     const item = { id: newId(), videoId, title: info.title || 'Vídeo do YouTube', author: info.author || '', by: p.name };
-    if (music.current) {
-      music.queue.push(item);
-      broadcastMusic();
+    const m = musicOf(channelId);
+    if (m.current) {
+      m.queue.push(item);
+      broadcastMusic(channelId);
     } else {
-      playItem(item);
+      playItem(channelId, item);
     }
-    systemChat(`${p.name} colocou ${item.title}`);
   },
 
-  'music:play'() {
-    setPlaying(true);
+  'music:play'(p) {
+    if (p.voice) setPlaying(p.voice, true);
   },
 
-  'music:pause'() {
-    setPlaying(false);
+  'music:pause'(p) {
+    if (p.voice) setPlaying(p.voice, false);
   },
 
   'music:skip'(p, msg) {
     // itemId evita pular duas músicas quando duas pessoas clicam juntas
-    if (music.current && msg.itemId === music.current.id) playItem(music.queue.shift());
+    const m = p.voice && musics.get(p.voice);
+    if (m?.current && msg.itemId === m.current.id) playItem(p.voice, m.queue.shift());
   },
 
   'music:seek'(p, msg) {
+    const m = p.voice && musics.get(p.voice);
     const t = Number(msg.t);
-    if (!music.current || !Number.isFinite(t)) return;
-    music.position = Math.max(0, Math.min(t, 86_400));
-    music.since = Date.now();
-    broadcastMusic();
+    if (!m?.current || !Number.isFinite(t)) return;
+    m.position = Math.max(0, Math.min(t, 86_400));
+    m.since = Date.now();
+    broadcastMusic(p.voice);
   },
 
   'music:ended'(p, msg) {
-    if (music.current && msg.itemId === music.current.id) playItem(music.queue.shift());
+    const m = p.voice && musics.get(p.voice);
+    if (m?.current && msg.itemId === m.current.id) playItem(p.voice, m.queue.shift());
   },
 
   'music:error'(p, msg) {
-    if (!music.current || msg.itemId !== music.current.id) return;
-    systemChat(`Não deu para tocar ${music.current.title}: ${ytErrorText(msg.code)}`);
-    log('AVISO', who(p), `o YouTube não tocou "${music.current.title}" (${ytErrorText(msg.code)}); pulei para a próxima`, 'escolher outro vídeo da mesma música');
-    playItem(music.queue.shift());
+    const m = p.voice && musics.get(p.voice);
+    if (!m?.current || msg.itemId !== m.current.id) return;
+    broadcastVoice(p.voice, { type: 'notice', text: `Não deu para tocar ${m.current.title}: ${ytErrorText(msg.code)}` });
+    log('AVISO', who(p), `o YouTube não tocou "${m.current.title}" (${ytErrorText(msg.code)}); pulei para a próxima`, 'escolher outro vídeo da mesma música');
+    playItem(p.voice, m.queue.shift());
   },
 
   'music:duration'(p, msg) {
+    const m = p.voice && musics.get(p.voice);
     const duration = Number(msg.duration);
-    if (music.current && msg.itemId === music.current.id && duration > 0) music.current.duration = duration;
+    if (m?.current && msg.itemId === m.current.id && duration > 0) m.current.duration = duration;
   },
 
   'music:remove'(p, msg) {
-    const i = music.queue.findIndex((item) => item.id === msg.itemId);
+    const m = p.voice && musics.get(p.voice);
+    const i = m ? m.queue.findIndex((item) => item.id === msg.itemId) : -1;
     if (i < 0) return;
-    music.queue.splice(i, 1);
-    broadcastMusic();
+    m.queue.splice(i, 1);
+    broadcastMusic(p.voice);
   },
 
   usage(p, msg) {
@@ -724,10 +993,12 @@ app.get('/api/config', (req, res) => {
   res.json({
     needsPassword: !!ROOM_PASSWORD,
     realtimeReady: !!(APP_ID && APP_SECRET),
+    discord: discordReady(),
     iceServers: ICE_SERVERS,
     version: APP_VERSION,
     fileMaxGB: FILE_MAX_GB,
     fileTtlHours: FILE_TTL_HOURS,
+    chatFileMaxMB: CHAT_FILE_MAX_MB,
   });
 });
 
@@ -831,6 +1102,9 @@ rtc.post('/sessions/:sid/tracks', ownSession, async (req, res) => {
   const tracks = cleanTracks(req.body?.tracks);
   const sessionDescription = cleanSdp(req.body?.sessionDescription);
   if (!tracks || sessionDescription === null) return badRequest(res);
+  if (tracks.some((t) => t.location === 'remote' && !sameVoice(req.participant, t.trackName))) {
+    return res.status(403).json({ errorCode: 'other_voice', errorDescription: 'Essa transmissão é de outra sala de voz.' });
+  }
   if (usageInfo().blocked && tracks.some((t) => t.trackName?.endsWith(':video'))) {
     return res.status(429).json({ errorCode: 'quota', errorDescription: 'O limite gratuito de vídeo deste mês acabou.' });
   }
@@ -872,6 +1146,141 @@ app.post('/api/auth-cookie', requireParticipant, (req, res) => {
   });
   res.json({ ok: true });
 });
+
+// ---------- login pelo Discord ----------
+// O servidor troca o código do Discord pelo nome e pela foto da pessoa e guarda isso num cookie
+// assinado. A conexão da sala lê o cookie, então ninguém consegue entrar com a conta de outro.
+
+function discordReady() {
+  return !!(DISCORD_ID && DISCORD_SECRET);
+}
+
+const isHttps = (req) => req.get('x-forwarded-proto') === 'https';
+
+function signDiscord(identity) {
+  const body = Buffer.from(JSON.stringify(identity)).toString('base64url');
+  return `${body}.${createHmac('sha256', DISCORD_SECRET).update(body).digest('base64url')}`;
+}
+
+function discordFrom(req) {
+  const [body, mac] = readCookie(req, 'sala_discord').split('.');
+  if (!body || !mac || !discordReady()) return null;
+  const expected = createHmac('sha256', DISCORD_SECRET).update(body).digest();
+  const given = Buffer.from(mac, 'base64url');
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
+  try {
+    const identity = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    return identity.exp > Date.now() ? identity : null;
+  } catch {
+    return null;
+  }
+}
+
+// Tem que estar cadastrado igualzinho em "Redirects" no portal do Discord.
+function discordRedirect(req) {
+  return `${isHttps(req) ? 'https' : 'http'}://${req.get('host')}/api/discord/callback`;
+}
+
+function discordAvatar(user) {
+  if (/^(a_)?[0-9a-f]+$/.test(user.avatar || '')) return `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=256`;
+  // Sem foto: o Discord mostra um dos bonecos padrão, escolhido pelo id (ou pela tag antiga #1234).
+  const tag = Number(user.discriminator);
+  const index = tag > 0 ? tag % 5 : Number((BigInt(user.id) >> 22n) % 6n);
+  return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
+}
+
+const DISCORD_TOKEN_EXPLAIN = {
+  invalid_client: [
+    'o Discord recusou o Client ID ou o Client Secret',
+    'confira DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET no .env (o Secret muda quando alguém clica em "Reset Secret") e rode "docker compose up -d --force-recreate"',
+  ],
+  invalid_grant: [
+    'o código do Discord expirou ou o endereço de retorno não bate',
+    'nada se for raro (é só tentar de novo). Se sempre acontecer, confira se o endereço de retorno está em OAuth2 → Redirects no portal do Discord',
+  ],
+};
+
+async function discordFetch(url, options, step) {
+  let res;
+  try {
+    res = await fetch(url, { ...options, signal: AbortSignal.timeout(10_000) });
+  } catch (err) {
+    throw Object.assign(new Error(`o servidor não conseguiu falar com o Discord ao ${step} (${err.message})`), {
+      todo: 'confira a internet do servidor (ex.: "ping 1.1.1.1"). Se estiver ok, veja discordstatus.com',
+    });
+  }
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) return data;
+  const [what, todo] = DISCORD_TOKEN_EXPLAIN[data.error] || [`o Discord respondeu com um erro ao ${step}`, 'se repetir, guarde este trecho do log para análise'];
+  throw Object.assign(new Error(`${what} [${res.status} ${data.error || data.message || ''}]`), { todo });
+}
+
+async function discordUser(code, redirectUri) {
+  const token = await discordFetch(
+    `${DISCORD_API}/oauth2/token`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Basic ${Buffer.from(`${DISCORD_ID}:${DISCORD_SECRET}`).toString('base64')}`,
+      },
+      body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri }),
+    },
+    'trocar o código pelo acesso',
+  );
+  const user = await discordFetch(`${DISCORD_API}/users/@me`, { headers: { Authorization: `Bearer ${token.access_token}` } }, 'pegar os dados da conta');
+  if (!/^\d{1,25}$/.test(user.id || '')) throw Object.assign(new Error('o Discord mandou uma conta sem id'), { todo: 'se repetir, guarde este trecho do log para análise' });
+  return user;
+}
+
+const discordRoutes = express.Router();
+
+discordRoutes.get('/login', (req, res) => {
+  if (!discordReady()) return res.redirect('/#discord=off');
+  const state = newId(16);
+  // Lax: o cookie precisa voltar junto quando o Discord manda a pessoa de volta para cá.
+  res.cookie('sala_oauth', state, { httpOnly: true, sameSite: 'lax', secure: isHttps(req), path: '/api/discord', maxAge: 10 * 60_000 });
+  const params = new URLSearchParams({ response_type: 'code', client_id: DISCORD_ID, scope: 'identify', state, redirect_uri: discordRedirect(req), prompt: 'none' });
+  res.redirect(`https://discord.com/oauth2/authorize?${params}`);
+});
+
+discordRoutes.get('/callback', async (req, res) => {
+  const state = readCookie(req, 'sala_oauth');
+  res.clearCookie('sala_oauth', { path: '/api/discord' });
+  if (req.query.error === 'access_denied') return res.redirect('/#discord=cancelado');
+  if (!discordReady() || req.query.error || !state || req.query.state !== state || typeof req.query.code !== 'string') {
+    if (req.query.error) log('AVISO', null, `o Discord não autorizou o login [${clip(req.query.error, 60)}]`, 'confira se o app do Discord está com o escopo "identify" e o endereço de retorno certo');
+    return res.redirect('/#discord=erro');
+  }
+  try {
+    const user = await discordUser(req.query.code, discordRedirect(req));
+    const identity = {
+      id: user.id,
+      name: cleanName(user.global_name || user.username) || 'Discord',
+      username: clip(user.username, 32),
+      avatar: discordAvatar(user),
+      exp: Date.now() + DISCORD_DAYS * 86_400_000,
+    };
+    res.cookie('sala_discord', signDiscord(identity), { httpOnly: true, sameSite: 'lax', secure: isHttps(req), path: '/', maxAge: DISCORD_DAYS * 86_400_000 });
+    log('INFO', null, `${identity.name} (@${identity.username}) fez login com o Discord`);
+    res.redirect('/');
+  } catch (err) {
+    log('ERRO', null, `o login com o Discord falhou: ${err.message}`, err.todo);
+    res.redirect('/#discord=erro');
+  }
+});
+
+discordRoutes.get('/me', (req, res) => {
+  const identity = discordFrom(req);
+  res.json(identity && { name: identity.name, username: identity.username, avatar: identity.avatar });
+});
+
+discordRoutes.post('/logout', (req, res) => {
+  res.clearCookie('sala_discord', { path: '/' });
+  res.json({ ok: true });
+});
+
+app.use('/api/discord', discordRoutes);
 
 const fileRoutes = express.Router();
 
@@ -940,7 +1349,7 @@ fileRoutes.put('/:id/chunk', requireParticipant, async (req, res) => {
     f.expiresAt = Date.now() + FILE_TTL_HOURS * 3600_000;
     await saveFiles();
     broadcast({ type: 'file:added', file: publicFile(f) });
-    systemChat(`${f.ownerName} enviou ${f.name} (${fmtBytes(f.size)}). Fica disponível por ${FILE_TTL_HOURS} h na aba Arquivos.`);
+    broadcast({ type: 'notice', text: `${f.ownerName} enviou ${f.name} (${fmtBytes(f.size)}). Fica ${FILE_TTL_HOURS} h na aba Arquivos.` }, req.participant.id);
     log('INFO', who(req.participant), `enviou o arquivo "${f.name}" (${fmtBytes(f.size)}); some em ${FILE_TTL_HOURS} h`);
   }
   res.json({ received: f.received, complete: f.complete });
@@ -958,9 +1367,17 @@ fileRoutes.delete('/:id', requireParticipant, async (req, res) => {
   res.json({ ok: true });
 });
 
+function readCookie(req, name) {
+  const raw = new RegExp(`(?:^|;\\s*)${name}=([^;]+)`).exec(req.headers.cookie || '')?.[1];
+  try {
+    return raw ? decodeURIComponent(raw) : '';
+  } catch {
+    return '';
+  }
+}
+
 function cookieParticipant(req) {
-  const cookie = /(?:^|;\s*)sala_auth=([^;]+)/.exec(req.headers.cookie || '')?.[1];
-  return participantFrom(decodeURIComponent(cookie || ''));
+  return participantFrom(readCookie(req, 'sala_auth'));
 }
 
 fileRoutes.get('/:id', (req, res) => {
@@ -1000,7 +1417,6 @@ soundRoutes.post('/', requireParticipant, express.raw({ type: () => true, limit:
   sounds.set(s.id, s);
   await saveSounds();
   broadcast({ type: 'sound:added', sound: publicSound(s) });
-  systemChat(`${p.name} colocou o som ${emoji} ${name} na mesa`);
   log('INFO', who(p), `adicionou o som "${name}" (${fmtBytes(req.body.length)})`);
   res.json(publicSound(s));
 });
@@ -1031,6 +1447,68 @@ soundRoutes.delete('/:id', requireParticipant, async (req, res) => {
 
 app.use('/api/sounds', soundRoutes);
 
+// ---------- anexos do chat ----------
+
+const attachmentRoutes = express.Router();
+
+// O arquivo vem cru no corpo (como octet-stream, para nenhum outro leitor mexer); nome, tipo e tamanho da imagem nos cabeçalhos.
+attachmentRoutes.post('/', requireParticipant, express.raw({ type: () => true, limit: CHAT_FILE_MAX_MB * 1e6 }), async (req, res) => {
+  const p = req.participant;
+  const header = (key) => {
+    try {
+      return decodeURIComponent(req.get(key) || '');
+    } catch {
+      return '';
+    }
+  };
+  if (!Buffer.isBuffer(req.body) || !req.body.length) return badRequest(res);
+  let free = Infinity;
+  try {
+    const fs = await statfs(ATTACH_DIR);
+    free = fs.bavail * fs.bsize;
+  } catch {
+    // sem informação de disco: segue
+  }
+  const name = cleanFileName(header('x-file-name')) || 'arquivo';
+  if (free - req.body.length < 2 * GB) {
+    log('AVISO', who(p), `não deu para guardar o anexo "${name}": só ${fmtBytes(free)} livres no disco`, 'liberar espaço no servidor (apagar canais antigos ou arquivos)');
+    return res.status(507).json({ errorCode: 'storage_full', errorDescription: 'Sem espaço no servidor.' });
+  }
+  const size = (key) => {
+    const n = Number(req.get(key));
+    return Number.isInteger(n) && n > 0 && n <= 100_000 ? n : undefined;
+  };
+  const meta = {
+    id: newId(12),
+    name,
+    type: header('x-file-type').toLowerCase().slice(0, 100) || 'application/octet-stream',
+    size: req.body.length,
+    width: size('x-width'),
+    height: size('x-height'),
+  };
+  await writeFile(attachPath(meta.id), req.body);
+  pendingUploads.set(meta.id, { meta, author: authorKey(p), createdAt: Date.now() });
+  res.json(meta);
+});
+
+attachmentRoutes.get('/:id', (req, res) => {
+  if (!cookieParticipant(req)) return res.status(401).type('text/plain; charset=utf-8').send('Entre na sala para ver este anexo.');
+  const a = attachments.get(req.params.id);
+  if (!a) return res.status(404).type('text/plain; charset=utf-8').send('Esse anexo foi apagado.');
+  const inline = INLINE_TYPES.has(a.type);
+  res.sendFile(attachPath(a.id), {
+    headers: {
+      'Content-Type': inline ? a.type : 'application/octet-stream',
+      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(a.name)}`,
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox",
+      'Cache-Control': 'private, max-age=31536000, immutable',
+    },
+  });
+});
+
+app.use('/api/attachments', attachmentRoutes);
+
 app.use(
   express.static(path.join(ROOT, 'public'), {
     setHeaders(res) {
@@ -1060,6 +1538,7 @@ wss.on('connection', (ws, req) => {
   ws.tokens = 60;
   ws.lastRefill = Date.now();
   ws.device = shortDevice(req.headers['user-agent']);
+  ws.discord = discordFrom(req);
   ws.on('pong', () => {
     ws.isAlive = true;
   });
@@ -1087,9 +1566,11 @@ wss.on('connection', (ws, req) => {
 await loadUsage();
 await loadFiles();
 await loadSounds();
+await loadChannels();
 
 setInterval(saveUsage, 30_000);
 setInterval(sweepFiles, 5 * 60_000);
+setInterval(sweepUploads, 10 * 60_000);
 setInterval(() => {
   if (participants.size) broadcast({ type: 'usage', usage: usageInfo() });
 }, 30_000);
@@ -1107,6 +1588,7 @@ setInterval(() => {
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
     await saveUsage();
+    await diskQueue;
     process.exit(0);
   });
 }
