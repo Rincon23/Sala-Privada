@@ -792,8 +792,16 @@ async function loadServers() {
   await saveServers();
 }
 
+// Os canais de um servidor e de um tipo, na ordem da lista (o admin muda arrastando).
+function channelsOf(serverId, kind) {
+  return [...channels.values()]
+    .filter((c) => c.serverId === serverId && c.kind === kind)
+    .sort((a, b) => (a.position ?? Infinity) - (b.position ?? Infinity) || a.createdAt - b.createdAt);
+}
+
 function addChannel(serverId, kind, name, createdBy) {
-  const c = { id: newId(), serverId, kind, name, createdAt: Date.now(), createdBy };
+  const position = (channelsOf(serverId, kind).at(-1)?.position ?? -1) + 1;
+  const c = { id: newId(), serverId, kind, name, position, createdAt: Date.now(), createdBy };
   channels.set(c.id, c);
   messages.set(c.id, []);
   return c;
@@ -804,7 +812,7 @@ function addChannel(serverId, kind, name, createdBy) {
 // uma mensagem por linha). Os anexos ficam em data/attachments e só somem se a mensagem for apagada.
 
 function publicChannel(c) {
-  return { id: c.id, serverId: c.serverId, kind: c.kind, name: c.name, createdAt: c.createdAt, lastTs: messages.get(c.id)?.at(-1)?.ts || 0 };
+  return { id: c.id, serverId: c.serverId, kind: c.kind, name: c.name, position: c.position, createdAt: c.createdAt, lastTs: messages.get(c.id)?.at(-1)?.ts || 0 };
 }
 
 const messagesFile = (channelId) => path.join(MESSAGES_DIR, `${channelId}.jsonl`);
@@ -844,6 +852,10 @@ async function loadChannels() {
   }
   for (const [kind, name] of [['text', 'geral'], ['voice', 'Geral']]) {
     if (![...channels.values()].some((c) => c.serverId === MAIN_SERVER && c.kind === kind)) addChannel(MAIN_SERVER, kind, name, null);
+  }
+  // Canais de antes da ordem por arrasto ficam na ordem em que foram criados.
+  for (const serverId of servers.keys()) {
+    for (const kind of ['text', 'voice']) channelsOf(serverId, kind).forEach((c, i) => (c.position = i));
   }
   await saveChannels();
   for (const c of channels.values()) {
@@ -990,6 +1002,31 @@ const handlers = {
     }
     const count = deleteChannel(c);
     log('AVISO', who(p), `apagou o canal "${c.name}"${count ? ` e as ${count} mensagens dele` : ''}`);
+  },
+
+  // O admin arrastou um canal: ele fica antes do canal `before` (ou no fim da lista).
+  'channel:move'(p, msg) {
+    const c = channels.get(String(msg.id ?? ''));
+    if (!c || !canSee(p, c.serverId)) return;
+    if (!p.admin) return send(p.ws, { type: 'notice', text: 'Só um admin muda a ordem dos canais.' });
+    const list = channelsOf(c.serverId, c.kind).filter((x) => x !== c);
+    const at = list.findIndex((x) => x.id === msg.before);
+    list.splice(at < 0 ? list.length : at, 0, c);
+    list.forEach((x, i) => (x.position = i));
+    saveChannels();
+    broadcastChannel(c.id, { type: 'channel:order', ids: list.map((x) => x.id) });
+  },
+
+  // O admin arrastou alguém para outra sala de voz: o app da pessoa troca de sala sozinho.
+  'voice:move'(p, msg) {
+    if (!p.admin) return send(p.ws, { type: 'notice', text: 'Só um admin move pessoas entre as salas de voz.' });
+    const target = participants.get(String(msg.pid ?? ''));
+    const id = String(msg.channelId ?? '');
+    if (!target?.voice || target.voice === id || channels.get(id)?.kind !== 'voice' || !canSeeChannel(p, id)) return;
+    if (!canSeeChannel(target, id)) return send(p.ws, { type: 'notice', text: `${target.name} não é membro desse servidor.` });
+    if (!target.online) return send(p.ws, { type: 'notice', text: `${target.name} está sem conexão agora.` });
+    send(target.ws, { type: 'voice:moved', channelId: id, by: p.name });
+    log('INFO', who(p), `moveu ${target.name} para a sala de voz "${channels.get(id).name}"`);
   },
 
   'stream:publish'(p, msg) {

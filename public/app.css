@@ -198,6 +198,20 @@ select.input { cursor: pointer; }
 .ch-member-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ch-member-icons { display: flex; gap: 4px; }
 .ch-member-icons .i { width: 14px; height: 14px; }
+/* Admin arrasta canais (para mudar a ordem) e pessoas (para outra sala de voz). */
+.channel-list.can-drag .ch-row, .channel-list.can-drag .ch-member { -webkit-touch-callout: none; user-select: none; }
+.drag-ghost {
+  position: fixed; z-index: 1000; margin: 0; pointer-events: none; opacity: 0.95;
+  background: var(--panel-2); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.drag-source { opacity: 0.35; }
+body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select: none; }
+.ch-row.drop-before::after, .ch-row.drop-after::after {
+  content: ""; position: absolute; left: 4px; right: 4px; height: 2px; border-radius: 2px; background: var(--accent);
+}
+.ch-row.drop-before::after { top: -2px; }
+.ch-row.drop-after::after { bottom: -2px; }
+.ch-row.drop-into { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
 .voice-status {
   display: flex; align-items: center; gap: 8px; padding: 10px 8px 10px 14px; flex: none;
   border-top: 1px solid var(--border); background: var(--panel);
@@ -455,6 +469,8 @@ dialog.lightbox img { display: block; max-width: 96vw; max-height: 88vh; border-
 }
 .soundpad-head { display: flex; align-items: center; gap: 12px; }
 .soundpad-head strong { flex: none; }
+.sound-stop { height: 30px; padding: 0 10px; gap: 6px; }
+.sound-stop .i { width: 12px; height: 12px; fill: currentColor; }
 .soundpad-vol { flex: 1; display: flex; align-items: center; gap: 8px; color: var(--muted); max-width: 220px; margin-left: auto; }
 .soundpad-vol .i { width: 16px; height: 16px; }
 .soundpad-grid {
@@ -550,6 +566,9 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 .admin-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .admin-sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .admin-tag { font-size: 11px; font-weight: 700; color: var(--accent); background: var(--accent-soft); padding: 3px 8px; border-radius: 999px; }
+.role-btn { color: var(--faint); }
+.role-btn.on { color: var(--accent); }
+.role-btn.on .i { fill: var(--accent-soft); }
 .admin-members { margin-top: 8px; padding-top: 4px; border-top: 1px solid var(--border); font-size: 13px; color: var(--muted); }
 .admin-members .toggle-row { padding: 6px 0; }
 .admin-members .toggle-text { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

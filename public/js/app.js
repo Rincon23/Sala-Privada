@@ -1,3 +1,4 @@
+import { makeDraggable } from './drag.js';
 import { explain } from './explain.js';
 import { icon } from './icons.js';
 import { MusicPlayer } from './music.js';
@@ -294,6 +295,8 @@ function onMessage(msg) {
       return setTimeout(() => location.reload(), 3000);
     case 'directory':
       return onDirectory(msg);
+    case 'account':
+      return onAccount(msg.account);
     case 'pong':
       return onPong(msg);
     case 'notice':
@@ -335,6 +338,19 @@ function onMessage(msg) {
       return renderAll();
     case 'channel:removed':
       return onChannelRemoved(msg.id);
+    case 'channel:order':
+      msg.ids.forEach((id, i) => {
+        const ch = state.channels.get(id);
+        if (ch) ch.position = i;
+      });
+      return renderChannels();
+    case 'voice:moved': {
+      const ch = state.channels.get(msg.channelId);
+      if (!ch || !state.voice || state.voice === ch.id) return;
+      // Quem estava olhando a sala de voz passa a ver a nova; quem estava num chat de texto continua nele.
+      joinVoice(ch.id, { show: state.view === state.voice });
+      return toast(`${msg.by} te moveu para ${ch.name}.`);
+    }
     case 'chat:history':
       return onHistory(msg);
     case 'chat:deleted':
@@ -364,6 +380,10 @@ function onMessage(msg) {
       const sound = state.sounds.find((s) => s.id === msg.id);
       return sound && playSound(sound, msg.by);
     }
+    case 'sound:stop':
+      if (!soundsPlaying.size) return;
+      stopSounds();
+      return toast(`${msg.by} parou os sons.`, { timeout: 3000 });
     case 'sound:added':
       state.sounds.push(msg.sound);
       return renderSoundpad();
@@ -383,7 +403,7 @@ function onWelcome(msg) {
   }
   state.participants = new Map(msg.state.participants.map((p) => [p.id, p]));
   state.streams = new Map(msg.state.streams.map((s) => [s.id, s]));
-  state.account = { id: msg.you.userId, email: msg.you.email, name: msg.you.name, admin: msg.you.admin };
+  state.account = { id: msg.you.userId, email: msg.you.email, name: msg.you.name, admin: msg.you.admin, host: msg.you.host };
   state.servers = new Map(msg.state.servers.map((s) => [s.id, s]));
   state.channels = new Map(msg.state.channels.map((c) => [c.id, c]));
   state.musics = new Map(Object.entries(msg.state.musics));
@@ -486,10 +506,13 @@ function setMyVoice(id) {
   if (me) me.voice = id;
 }
 
-function joinVoice(id) {
+function joinVoice(id, { show = true } = {}) {
   if (state.channels.get(id)?.kind !== 'voice') return;
   if (state.voice === id) return showView(id);
-  if (state.voice) stopLocalMedia();
+  if (state.voice) {
+    stopLocalMedia();
+    stopSounds();
+  }
   state.voice = id;
   setMyVoice(id);
   send({ type: 'voice:join', channelId: id });
@@ -505,7 +528,8 @@ function joinVoice(id) {
   syncMusic();
   bindChat(voiceChat, id);
   reconcile();
-  showView(id);
+  if (show) showView(id);
+  else renderAll();
 }
 
 function leaveVoice({ notify = true } = {}) {
@@ -520,6 +544,7 @@ function leaveVoice({ notify = true } = {}) {
   state.focusKey = null;
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   toggleSoundpad(false);
+  stopSounds(); // os sons eram daquela sala
   syncMusic();
   reconcile();
   renderAll();
@@ -1711,10 +1736,22 @@ function onDirectory(d) {
   renderAdmin();
 }
 
+// O host deu ou tirou o cargo de admin desta conta.
+function onAccount(account) {
+  const was = state.account?.admin;
+  state.account = { id: account.id, email: account.email, name: account.name, admin: account.admin, host: account.host };
+  if (was !== account.admin) toast(account.admin ? 'Você agora é admin da sala.' : 'Você não é mais admin da sala.');
+  if (!account.admin && $('#admin-dialog').open) $('#admin-dialog').close();
+  renderAll();
+  renderSoundpad();
+}
+
 // ---------- canais ----------
 
 function sortedChannels(kind, serverId = currentServer()?.id) {
-  return [...state.channels.values()].filter((c) => c.kind === kind && c.serverId === serverId).sort((a, b) => a.createdAt - b.createdAt);
+  return [...state.channels.values()]
+    .filter((c) => c.kind === kind && c.serverId === serverId)
+    .sort((a, b) => (a.position ?? 0) - (b.position ?? 0) || a.createdAt - b.createdAt);
 }
 
 function channelLabel(ch) {
@@ -1771,7 +1808,9 @@ function renderView() {
 }
 
 function renderChannels() {
-  if (!state.inRoom) return;
+  // Durante um arrasto a lista fica parada; ela é desenhada de novo ao soltar.
+  if (!state.inRoom || channelDrag?.active) return;
+  $('#channel-list').classList.toggle('can-drag', !!state.account?.admin);
   const view = currentView();
   const groups = [
     ['text', 'Canais de texto'],
@@ -1785,6 +1824,8 @@ function renderChannels() {
     for (const ch of sortedChannels(kind)) {
       const row = document.createElement('div');
       row.className = 'ch-row';
+      row.dataset.id = ch.id;
+      row.dataset.kind = kind;
       row.classList.toggle('active', ch.id === view?.id);
       row.classList.toggle('connected', ch.id === state.voice);
       row.classList.toggle('unread', kind === 'text' && isUnread(ch));
@@ -1797,11 +1838,13 @@ function renderChannels() {
       if (!members.length) continue;
       const ul = document.createElement('ul');
       ul.className = 'ch-members';
+      ul.dataset.voice = ch.id;
       for (const p of members) {
         const mine = p.id === state.me.id;
         const li = document.createElement('li');
         li.className = 'ch-member';
         li.dataset.speaker = p.id;
+        li.dataset.member = p.id;
         li.classList.toggle('offline', !p.online);
         const icons = [
           (mine ? local.camera : cameraOf(p.id)) && icon('video'),
@@ -1830,6 +1873,76 @@ function renderChannels() {
     const where = voice.serverId !== currentServer()?.id ? ` · ${state.servers.get(voice.serverId)?.name || ''}` : '';
     $('#voice-status-name').textContent = `${voice.name}${where}`;
   }
+}
+
+// ---------- arrastar canais e pessoas (só admin) ----------
+
+let channelDrag = null;
+let dropTarget = null; // { before } ao arrastar um canal; { pid, channelId } ao arrastar uma pessoa
+
+function clearDropMarks() {
+  for (const el of $$('#channel-list .drop-before, #channel-list .drop-after, #channel-list .drop-into')) {
+    el.classList.remove('drop-before', 'drop-after', 'drop-into');
+  }
+}
+
+function bindChannelDrag() {
+  channelDrag = makeDraggable($('#channel-list'), {
+    selector: '.ch-row, .ch-member',
+    canDrag: () => !!state.account?.admin,
+    onMove(el, x, y) {
+      clearDropMarks();
+      dropTarget = el.classList.contains('ch-row') ? channelDropAt(el, y) : memberDropAt(el, x, y);
+    },
+    onDrop(el) {
+      if (dropTarget?.pid) moveMember(dropTarget.pid, dropTarget.channelId);
+      else if (dropTarget) moveChannel(el.dataset.id, dropTarget.before);
+    },
+    onEnd() {
+      dropTarget = null;
+      renderChannels();
+    },
+  });
+}
+
+// Um canal cai entre os do mesmo tipo: antes do primeiro cuja metade está abaixo do ponteiro.
+function channelDropAt(el, y) {
+  const rows = $$('.ch-row', el.closest('.ch-group')).filter((r) => r !== el);
+  const next = rows.find((r) => {
+    const box = r.getBoundingClientRect();
+    return y < box.top + box.height / 2;
+  });
+  if (next) next.classList.add('drop-before');
+  else rows.at(-1)?.classList.add('drop-after');
+  return { before: next?.dataset.id || null };
+}
+
+// Uma pessoa cai na sala de voz embaixo do ponteiro (na linha da sala ou na lista de quem está nela).
+function memberDropAt(el, x, y) {
+  const spot = document.elementFromPoint(x, y)?.closest('#channel-list .ch-row[data-kind="voice"], #channel-list .ch-members');
+  const channelId = spot?.dataset.id || spot?.dataset.voice;
+  const pid = el.dataset.member;
+  if (!channelId || channelId === state.participants.get(pid)?.voice) return null;
+  $(`#channel-list .ch-row[data-id="${channelId}"]`)?.classList.add('drop-into');
+  return { pid, channelId };
+}
+
+function moveChannel(id, before) {
+  const ch = state.channels.get(id);
+  if (!ch) return;
+  const old = sortedChannels(ch.kind, ch.serverId);
+  const list = old.filter((c) => c !== ch);
+  const at = before ? list.findIndex((c) => c.id === before) : -1;
+  list.splice(at < 0 ? list.length : at, 0, ch);
+  if (list.every((c, i) => c === old[i])) return;
+  // Já mostra na ordem nova; o servidor confirma para todo mundo.
+  list.forEach((c, i) => (c.position = i));
+  send({ type: 'channel:move', id, before });
+}
+
+function moveMember(pid, channelId) {
+  if (pid === state.me.id) return joinVoice(channelId);
+  send({ type: 'voice:move', pid, channelId });
 }
 
 function onChannelRemoved(id) {
@@ -2269,6 +2382,7 @@ function bindChannels() {
     const edit = e.target.closest('[data-edit]');
     if (edit) openChannelDialog({ channel: state.channels.get(edit.dataset.edit) });
   });
+  bindChannelDrag();
   $('#channel-form').addEventListener('submit', (e) => {
     e.preventDefault();
     const name = $('#channel-name').value.trim();
@@ -2398,10 +2512,16 @@ function renderAdmin() {
       const li = document.createElement('li');
       li.className = 'admin-item';
       li.dataset.user = u.id;
-      const actions = u.admin
-        ? '<span class="admin-tag">admin</span>'
-        : `<button class="btn secondary small" type="button" data-act="password">Nova senha</button><button class="icon-btn sm" type="button" data-act="delete-user" aria-label="Apagar conta" title="Apagar conta">${icon('trash')}</button>`;
-      li.innerHTML = `<div class="admin-row"><div class="admin-main"><div class="admin-name"></div><div class="admin-sub"></div></div>${actions}</div>`;
+      const host = state.account?.host;
+      const tag = u.host ? '<span class="admin-tag">host</span>' : u.admin ? '<span class="admin-tag">admin</span>' : '';
+      // Só o host dá e tira o cargo; a conta de outro admin, só ele mexe.
+      const roleLabel = u.admin ? 'Tirar o cargo de admin' : 'Tornar admin';
+      const role = host && !u.host ? `<button class="icon-btn sm role-btn${u.admin ? ' on' : ''}" type="button" data-act="role" aria-label="${roleLabel}" title="${roleLabel}">${icon('shield')}</button>` : '';
+      const manage =
+        !u.host && (!u.admin || host)
+          ? `<button class="btn secondary small" type="button" data-act="password">Nova senha</button><button class="icon-btn sm" type="button" data-act="delete-user" aria-label="Apagar conta" title="Apagar conta">${icon('trash')}</button>`
+          : '';
+      li.innerHTML = `<div class="admin-row"><div class="admin-main"><div class="admin-name"></div><div class="admin-sub"></div></div>${tag}${role}${manage}</div>`;
       $('.admin-name', li).textContent = u.name;
       $('.admin-sub', li).textContent = u.email;
       return li;
@@ -2454,7 +2574,17 @@ function bindAdmin() {
     const b = e.target.closest('[data-act]');
     const u = adminUsers.find((x) => x.id === e.target.closest('[data-user]')?.dataset.user);
     if (!b || !u) return;
-    if (b.dataset.act === 'password') {
+    if (b.dataset.act === 'role') {
+      const ask = u.admin
+        ? `Tirar o cargo de admin de ${u.name}?`
+        : `Tornar ${u.name} admin? A pessoa vai poder criar servidores, mudar membros, trocar senhas, apagar contas, tirar sons da mesa e arrastar canais e pessoas.`;
+      if (!confirm(ask)) return;
+      adminAction(async () => {
+        await adminApi('PUT', `/users/${u.id}/admin`, { admin: !u.admin });
+        adminUsers = await adminApi('GET', '/users');
+        renderAdmin();
+      });
+    } else if (b.dataset.act === 'password') {
       const password = prompt(`Senha nova para ${u.name} (pelo menos 6 caracteres). Depois passe para a pessoa; ela pode trocar em Configurações.`);
       if (password) {
         adminAction(async () => {
@@ -2806,25 +2936,71 @@ function loadSound(url) {
   return soundBuffers.get(url);
 }
 
+// Som comprido toca direto do arquivo, aos poucos: decodificar 3 minutos de uma vez pesa na memória.
+const isLongSound = (s) => s.duration > 20;
+
 async function playSound(sound, by) {
   unlockAudio();
   if (!audioCtx) return;
   flashSound(sound, by);
   if (state.deafened || soundVolume === 0) return;
   try {
+    if (isLongSound(sound)) return playLongSound(sound);
     const source = audioCtx.createBufferSource();
     source.buffer = await loadSound(sound.url);
     const gain = audioCtx.createGain();
     gain.gain.value = (soundVolume / 100) ** 2;
     source.connect(gain).connect(audioCtx.destination);
-    // No máximo 4 sons juntos: o mais antigo para.
-    if (soundsPlaying.size >= 4) soundsPlaying.values().next().value.stop();
-    soundsPlaying.add(source);
-    source.onended = () => soundsPlaying.delete(source);
+    source.onended = trackSound(() => source.stop());
     source.start();
   } catch (err) {
     reportError(err, 'sound', `o som ${sound.name}`);
   }
+}
+
+function playLongSound(sound) {
+  const audio = new Audio(sound.url);
+  audio.volume = (soundVolume / 100) ** 2;
+  if (settings.outId && audio.setSinkId) audio.setSinkId(settings.outId).catch(() => {});
+  const stop = trackSound(() => {
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+  });
+  audio.onended = stop;
+  audio.onerror = () => {
+    stop();
+    reportError(Object.assign(new Error('O som não carregou'), { code: 'sound_load' }), 'sound', `o som ${sound.name}`);
+  };
+  audio.play().catch(stop);
+}
+
+// Guarda o que está tocando para dar para parar. No máximo 4 sons juntos: o mais antigo para.
+// Devolve a função que para este som (pode ser chamada mais de uma vez).
+function trackSound(stopNow) {
+  if (soundsPlaying.size >= 4) soundsPlaying.values().next().value();
+  const stop = () => {
+    if (!soundsPlaying.delete(stop)) return;
+    stopNow();
+    renderSoundStop();
+  };
+  soundsPlaying.add(stop);
+  renderSoundStop();
+  return stop;
+}
+
+function stopSounds() {
+  for (const stop of [...soundsPlaying]) stop();
+}
+
+function renderSoundStop() {
+  $('#sound-stop').hidden = !soundsPlaying.size;
+}
+
+// Para os sons para todo mundo da sala de voz.
+function clickStopSounds() {
+  stopSounds();
+  send({ type: 'sound:stop' });
 }
 
 function clickSound(id) {
@@ -2880,8 +3056,8 @@ function toggleSoundpad(open = $('#soundpad').hidden) {
   if (!open) return;
   renderSoundpad();
   unlockAudio();
-  // Carrega tudo de antemão para o clique tocar na hora.
-  if (audioCtx) for (const s of state.sounds) loadSound(s.url).catch(() => {});
+  // Carrega os curtos de antemão para o clique tocar na hora (os longos vão chegando enquanto tocam).
+  if (audioCtx) for (const s of state.sounds) if (!isLongSound(s)) loadSound(s.url).catch(() => {});
 }
 
 function onSoundRightClick(id) {
@@ -2926,6 +3102,7 @@ function bindSoundpad() {
     toggleSoundpad();
   });
   $('#soundpad-close').addEventListener('click', () => toggleSoundpad(false));
+  $('#sound-stop').addEventListener('click', clickStopSounds);
   $('#sound-volume').value = soundVolume;
   $('#sound-volume').addEventListener('input', (e) => {
     soundVolume = Number(e.target.value);
@@ -3006,9 +3183,10 @@ function bindSoundpad() {
 
 async function openSettings() {
   $('#set-name').value = state.participants.get(state.me.id)?.name || '';
-  $('#set-email').textContent = `Conta: ${state.account?.email || ''}${state.account?.admin ? ' (admin)' : ''}`;
-  // A senha do admin fica no .env do servidor.
-  $('#pw-change').hidden = !!state.account?.admin;
+  const role = state.account?.host ? ' (host)' : state.account?.admin ? ' (admin)' : '';
+  $('#set-email').textContent = `Conta: ${state.account?.email || ''}${role}`;
+  // A senha do host fica no .env do servidor.
+  $('#pw-change').hidden = !!state.account?.host;
   $('#pw-change').open = false;
   $('#pw-error').textContent = '';
   $('#btn-admin').hidden = !state.account?.admin;
