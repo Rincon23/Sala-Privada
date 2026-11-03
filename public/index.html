@@ -26,7 +26,16 @@
       <h1>Sala Privada</h1>
       <p class="sub">Voz, vídeo, telas e música com a galera.</p>
 
-      <div class="field">
+      <div class="discord-block" id="join-discord" hidden>
+        <a class="btn discord block" id="discord-login" href="/api/discord/login"><span data-icon="discord"></span>Continuar com o Discord</a>
+        <div class="divider">ou entre só com um nome</div>
+      </div>
+      <div class="identity" id="join-identity" hidden>
+        <div class="avatar"></div>
+        <div class="identity-main"><div class="identity-name"></div><div class="identity-sub"></div></div>
+        <button class="btn secondary small" id="discord-logout" type="button" title="Sair da conta do Discord neste aparelho">Sair</button>
+      </div>
+      <div class="field" id="join-name-field">
         <label for="join-name">Seu nome</label>
         <input id="join-name" class="input" maxlength="32" placeholder="Como te chamam?" autocomplete="nickname" required>
       </div>
@@ -49,6 +58,7 @@
 
   <div id="room" class="room" hidden>
     <header class="topbar">
+      <button class="icon-btn" id="btn-channels" type="button" aria-label="Canais" title="Canais" data-icon="menu"></button>
       <div class="brand"><img src="/icons/icon.svg" alt="" width="28" height="28"><span>Sala Privada</span></div>
       <div class="mini-player" id="mini" hidden>
         <span data-icon="music" class="mini-icon"></span>
@@ -64,17 +74,31 @@
     </header>
 
     <main class="main">
-      <section class="stage" id="stage">
+      <nav class="channels" id="channels" aria-label="Canais">
+        <div class="channel-list" id="channel-list"></div>
+        <div class="voice-status" id="voice-status" hidden>
+          <div class="voice-status-main"><strong>Voz conectada</strong><span id="voice-status-name"></span></div>
+          <button class="icon-btn sm" id="voice-status-leave" type="button" aria-label="Desconectar da voz" title="Desconectar da voz" data-icon="leave"></button>
+        </div>
+      </nav>
+      <div class="channels-backdrop" id="channels-backdrop"></div>
+
+      <section class="stage" id="stage" hidden>
         <div class="livebar" id="livebar" hidden></div>
         <div class="focus" id="focus" hidden></div>
         <div class="grid" id="grid"></div>
+      </section>
+
+      <section class="text-view" id="text-view">
+        <header class="text-head"><span data-icon="hash"></span><h2 id="text-title"></h2></header>
+        <div class="chat-view" id="text-chat"></div>
       </section>
 
       <aside class="side">
         <nav class="tabs" role="tablist">
           <button class="tab" data-tab="people" role="tab" type="button"><span data-icon="users"></span>Pessoas <span class="count" id="people-count">0</span></button>
           <button class="tab" data-tab="music" role="tab" type="button"><span data-icon="music"></span>Música</button>
-          <button class="tab" data-tab="chat" role="tab" type="button"><span data-icon="chat"></span>Chat <span class="badge" id="chat-badge" hidden></span></button>
+          <button class="tab" data-tab="chat" id="tab-chat" role="tab" type="button" hidden><span data-icon="chat"></span>Chat <span class="badge" id="chat-badge" hidden></span></button>
           <button class="tab" data-tab="files" role="tab" type="button"><span data-icon="paperclip"></span>Arquivos <span class="count" id="files-count"></span></button>
         </nav>
 
@@ -105,11 +129,7 @@
         </div>
 
         <div class="panel chat" data-panel="chat">
-          <div class="messages" id="messages"></div>
-          <form class="inline-form chat-form" id="chat-form">
-            <input class="input" id="chat-input" placeholder="Mensagem" maxlength="1000" autocomplete="off">
-            <button class="btn square" type="submit" aria-label="Enviar" data-icon="send"></button>
-          </form>
+          <div class="chat-view" id="voice-chat"></div>
         </div>
 
         <div class="panel files-panel" data-panel="files">
@@ -131,7 +151,7 @@
       <button class="ctl" id="btn-cam" type="button"></button>
       <button class="ctl" id="btn-screen" type="button"></button>
       <button class="ctl" id="btn-sounds" type="button" aria-label="Mesa de sons" title="Mesa de sons" aria-expanded="false" data-icon="sparkles"></button>
-      <button class="ctl leave" id="btn-leave" type="button" aria-label="Sair da sala" title="Sair da sala" data-icon="leave"></button>
+      <button class="ctl leave" id="btn-leave" type="button" aria-label="Desconectar da voz" title="Desconectar da voz" data-icon="leave"></button>
     </footer>
 
     <section class="soundpad" id="soundpad" hidden aria-label="Mesa de sons">
@@ -189,8 +209,33 @@
           <div class="usage-bar"><div id="usage-fill"></div></div>
           <p class="hint">Se chegar no limite, câmera e telas pausam até o mês virar. A voz continua.</p>
         </div>
+        <button class="btn secondary block" type="button" id="btn-exit"><span data-icon="leave"></span>Sair da Sala Privada</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="channel-dialog" aria-labelledby="channel-title">
+    <form class="dialog" id="channel-form">
+      <div class="dialog-head">
+        <h2 id="channel-title">Criar canal</h2>
+        <button class="icon-btn" type="button" id="channel-cancel" aria-label="Fechar" data-icon="x"></button>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="channel-name">Nome do canal</label>
+          <input id="channel-name" class="input" maxlength="32" required autocomplete="off">
+        </div>
+        <div class="dialog-actions">
+          <button class="btn danger" type="button" id="channel-delete">Apagar canal</button>
+          <button class="btn" type="submit" id="channel-save">Criar canal</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="lightbox" class="lightbox" aria-label="Imagem">
+    <img alt="">
+    <a class="lightbox-link" download>Baixar imagem</a>
   </dialog>
 
   <dialog id="sound-dialog" aria-labelledby="sound-title">
