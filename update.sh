@@ -1,17 +1,27 @@
-#!/bin/bash
-# Atualiza a Sala Privada no servidor com o que está no GitHub: só entra no ar o que já teve push.
-# Uso, no servidor: cd ~/sala-privada && ./update.sh
+#!/usr/bin/env bash
+# Atualiza a Sala Privada neste host: puxa do GitHub o que teve push, reconstrói a
+# imagem e reinicia o container. Rode na pasta do projeto:  ./update.sh
 set -euo pipefail
+
 cd "$(dirname "$0")"
 
-branch=$(git rev-parse --abbrev-ref HEAD)
-echo "==> Baixando a branch $branch do GitHub..."
-git fetch --quiet origin "$branch"
-# Só avança: se alguém mexeu nos arquivos aqui no servidor, para em vez de misturar.
-git merge --ff-only --quiet "origin/$branch"
+if [ ! -f .env ]; then
+  echo "Falta .env — copie de .env.example e preencha antes de atualizar." >&2
+  exit 1
+fi
 
-echo "==> Montando o app e reiniciando o container..."
+echo "==> git pull ($(git rev-parse --abbrev-ref HEAD))"
+git pull --ff-only
+
+echo "==> build + up (reconstrói se o código mudou)"
 docker compose up -d --build
-docker image prune -f >/dev/null
 
-echo "==> No ar: $(git log -1 --format='%h %s')"
+echo "==> removendo imagens órfãs"
+docker image prune -f >/dev/null || true
+
+echo "==> status"
+echo "No ar: $(git log -1 --format='%h %s')"
+docker compose ps
+echo
+sleep 3
+docker compose logs --tail=30 sala-privada
