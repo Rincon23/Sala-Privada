@@ -26,29 +26,34 @@
       <h1>Sala Privada</h1>
       <p class="sub">Voz, vídeo, telas e música com a galera.</p>
 
-      <div class="discord-block" id="join-discord" hidden>
-        <a class="btn discord block" id="discord-login" href="/api/discord/login"><span data-icon="discord"></span>Continuar com o Discord</a>
-        <div class="divider">ou entre só com um nome</div>
-      </div>
-      <div class="identity" id="join-identity" hidden>
-        <div class="avatar"></div>
-        <div class="identity-main"><div class="identity-name"></div><div class="identity-sub"></div></div>
-        <button class="btn secondary small" id="discord-logout" type="button" title="Sair da conta do Discord neste aparelho">Sair</button>
-      </div>
-      <div class="field" id="join-name-field">
-        <label for="join-name">Seu nome</label>
-        <input id="join-name" class="input" maxlength="32" placeholder="Como te chamam?" autocomplete="nickname" required>
-      </div>
-      <div class="field" id="join-pass-field" hidden>
-        <label for="join-pass">Senha da sala</label>
-        <input id="join-pass" class="input" type="password" autocomplete="current-password">
+      <div class="auth-tabs" role="tablist">
+        <button class="auth-tab" type="button" role="tab" data-mode="login">Entrar</button>
+        <button class="auth-tab" type="button" role="tab" data-mode="register">Criar conta</button>
       </div>
 
-      <label class="toggle-row"><span class="toggle-text"><span data-icon="mic"></span>Entrar com o microfone ligado</span><input type="checkbox" class="switch" id="join-mic"></label>
-      <label class="toggle-row"><span class="toggle-text"><span data-icon="video"></span>Entrar com a câmera ligada</span><input type="checkbox" class="switch" id="join-cam"></label>
+      <div class="field" id="field-name" hidden>
+        <label for="join-name">Seu nome</label>
+        <input id="join-name" class="input" maxlength="32" placeholder="Como te chamam?" autocomplete="nickname">
+      </div>
+      <div class="field">
+        <label for="join-email">E-mail</label>
+        <input id="join-email" class="input" type="email" maxlength="120" autocomplete="email" required>
+      </div>
+      <div class="field">
+        <label for="join-pass">Senha</label>
+        <input id="join-pass" class="input" type="password" autocomplete="current-password" required>
+      </div>
+      <div class="field" id="field-code" hidden>
+        <label for="join-code">Senha da sala</label>
+        <input id="join-code" class="input" type="password" autocomplete="off">
+        <p class="hint">Pergunte para quem cuida da sala. Ela só é pedida para criar a conta.</p>
+      </div>
+
+      <label class="toggle-row"><span class="toggle-text"><span data-icon="mic"></span>Microfone ligado ao entrar na voz</span><input type="checkbox" class="switch" id="join-mic"></label>
+      <label class="toggle-row"><span class="toggle-text"><span data-icon="video"></span>Câmera ligada ao entrar na voz</span><input type="checkbox" class="switch" id="join-cam"></label>
 
       <p class="form-error" id="join-error" role="alert"></p>
-      <button class="btn block" id="join-btn" type="submit">Entrar na sala</button>
+      <button class="btn block" id="join-btn" type="submit">Entrar</button>
       <button class="btn secondary block" type="button" data-install hidden><span data-icon="download"></span>Instalar o app</button>
 
       <p class="presence"><span class="dot-live"></span><span id="presence">Vendo quem está na sala…</span></p>
@@ -75,6 +80,8 @@
 
     <main class="main">
       <nav class="channels" id="channels" aria-label="Canais">
+        <button class="server-head" id="server-head" type="button" aria-haspopup="true" aria-expanded="false"><span class="server-name" id="server-name"></span><span data-icon="chevron"></span></button>
+        <div class="server-menu" id="server-menu" hidden></div>
         <div class="channel-list" id="channel-list"></div>
         <div class="voice-status" id="voice-status" hidden>
           <div class="voice-status-main"><strong>Voz conectada</strong><span id="voice-status-name"></span></div>
@@ -161,7 +168,7 @@
         <button class="icon-btn sm" id="soundpad-close" type="button" aria-label="Fechar a mesa de sons" data-icon="x"></button>
       </div>
       <div class="soundpad-grid" id="soundpad-grid"></div>
-      <p class="hint">Todo mundo na sala ouve. Clique com o botão direito num som seu para tirar.</p>
+      <p class="hint">Todo mundo na sala ouve. Qualquer um adiciona; para tirar um som, um admin clica nele com o botão direito.</p>
     </section>
     <div class="sound-flash" id="sound-flash" hidden></div>
   </div>
@@ -181,6 +188,7 @@
         <div class="field">
           <label for="set-name">Seu nome</label>
           <input id="set-name" class="input" maxlength="32" autocomplete="nickname">
+          <p class="hint" id="set-email"></p>
         </div>
         <div class="field">
           <label for="set-mic">Microfone</label>
@@ -209,9 +217,39 @@
           <div class="usage-bar"><div id="usage-fill"></div></div>
           <p class="hint">Se chegar no limite, câmera e telas pausam até o mês virar. A voz continua.</p>
         </div>
-        <button class="btn secondary block" type="button" id="btn-exit"><span data-icon="leave"></span>Sair da Sala Privada</button>
+        <details class="pw-change" id="pw-change">
+          <summary>Trocar a senha</summary>
+          <div class="pw-fields">
+            <input id="pw-current" class="input" type="password" placeholder="Senha atual" autocomplete="current-password">
+            <input id="pw-new" class="input" type="password" placeholder="Senha nova (pelo menos 6 caracteres)" autocomplete="new-password">
+            <p class="form-error" id="pw-error" role="alert"></p>
+            <button class="btn secondary" type="button" id="pw-save">Trocar a senha</button>
+          </div>
+        </details>
+        <button class="btn secondary block" type="button" id="btn-admin" hidden><span data-icon="users"></span>Painel de admin</button>
+        <button class="btn secondary block" type="button" id="btn-exit"><span data-icon="leave"></span>Sair da conta</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="admin-dialog" aria-labelledby="admin-title">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h2 id="admin-title">Painel de admin</h2>
+        <button class="icon-btn" type="button" id="admin-close" aria-label="Fechar" data-icon="x"></button>
+      </div>
+      <div class="dialog-body">
+        <h3 class="section-title">Servidores</h3>
+        <form class="inline-form admin-new" id="server-form">
+          <input class="input" id="server-new" maxlength="32" placeholder="Nome do servidor novo" required autocomplete="off">
+          <button class="btn" type="submit">Criar</button>
+        </form>
+        <ul class="admin-list" id="admin-servers"></ul>
+        <h3 class="section-title">Contas</h3>
+        <ul class="admin-list" id="admin-users"></ul>
+        <p class="form-error" id="admin-error" role="alert"></p>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="channel-dialog" aria-labelledby="channel-title">
@@ -248,7 +286,7 @@
         <div class="field">
           <label for="sound-file">Arquivo de áudio</label>
           <input id="sound-file" class="input file-input" type="file" accept="audio/*" required>
-          <p class="hint">MP3, WAV, OGG… até 2 MB e 15 segundos.</p>
+          <p class="hint">MP3, WAV, OGG… de até 3 minutos.</p>
         </div>
         <div class="sound-name-row">
           <div class="field emoji-field">

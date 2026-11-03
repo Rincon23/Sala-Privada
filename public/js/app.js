@@ -2,6 +2,7 @@ import { explain } from './explain.js';
 import { icon } from './icons.js';
 import { MusicPlayer } from './music.js';
 import { RtcApi, SfuConnection } from './rtc.js';
+import { compactWav } from './wav.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -32,6 +33,8 @@ const QUALITY = {
 const SURFACE_NAMES = { monitor: 'Tela', window: 'Janela', browser: 'Aba' };
 const QUOTA_MSG = 'O limite gratuito de vídeo deste mês acabou. A voz continua funcionando.';
 const REBUILD_DELAYS = [0, 2000, 5000, 10000, 20000, 30000];
+const SOUND_MAX_SECONDS = 180;
+const SOUND_MAX_BYTES = 10 * 1024 * 1024; // o mesmo limite do servidor
 const canShareScreen = !!navigator.mediaDevices?.getDisplayMedia;
 
 const settings = {
@@ -45,12 +48,14 @@ const settings = {
 
 const state = {
   config: null,
-  discord: null,
   me: null,
   inRoom: false,
   leaving: false,
   participants: new Map(),
   streams: new Map(),
+  account: null, // a conta logada: { id, email, name, admin }
+  servers: new Map(),
+  server: store.get('server', null), // servidor aberto na lista de canais
   channels: new Map(),
   musics: new Map(), // id da sala de voz -> música dela
   files: new Map(),
@@ -112,69 +117,81 @@ async function init() {
   setupInstall();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
-  $('#join-name').value = store.get('name', '');
+  $('#join-email').value = store.get('email', '');
   $('#join-mic').checked = state.micOn;
   $('#join-cam').checked = store.get('joinCam', false);
   $('#join-form').addEventListener('submit', onJoinSubmit);
-  bindDiscord();
+  for (const tab of $$('.auth-tab')) tab.addEventListener('click', () => setAuthMode(tab.dataset.mode));
   bindRoomUi();
 
   try {
     state.config = await fetch('/api/config').then((r) => r.json());
   } catch {
-    state.config = { needsPassword: false, realtimeReady: false, iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] };
+    state.config = { needsCode: false, realtimeReady: false, iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] };
   }
-  if (state.config.discord) state.discord = await fetch('/api/discord/me').then((r) => r.json()).catch(() => null);
-  $('#join-pass-field').hidden = !state.config.needsPassword;
   $('#join-warning').hidden = state.config.realtimeReady;
-  renderJoinIdentity();
-  showDiscordResult();
+  setAuthMode(store.get('email', '') ? 'login' : 'register');
   refreshPresence();
   presenceTimer = setInterval(refreshPresence, 10000);
-  if (state.discord) $('#join-btn').focus();
-  else if (!$('#join-name').value) $('#join-name').focus();
+  // Já entrou neste aparelho antes: vai direto para a sala.
+  state.account = await fetch('/api/auth/me').then((r) => r.json()).catch(() => null);
+  if (state.account) return enterWithAccount();
+  (store.get('email', '') ? $('#join-pass') : $('#join-name')).focus();
 }
 
-// ---------- login com o Discord ----------
+// ---------- conta ----------
 
-const DISCORD_RESULTS = {
-  cancelado: 'Login com o Discord cancelado.',
-  erro: 'Não deu para entrar com o Discord. Tente de novo.',
-  off: 'O login com o Discord não está configurado no servidor.',
-};
+let authMode = 'login';
 
-function bindDiscord() {
-  // A página sai para o Discord e volta: guarda as escolhas para não perder.
-  $('#discord-login').addEventListener('click', () => {
-    store.set('joinMic', $('#join-mic').checked);
-    store.set('joinCam', $('#join-cam').checked);
-  });
-  $('#discord-logout').addEventListener('click', async () => {
-    await fetch('/api/discord/logout', { method: 'POST' }).catch(() => {});
-    state.discord = null;
-    renderJoinIdentity();
-    $('#join-name').focus();
-  });
+function setAuthMode(mode) {
+  authMode = mode;
+  const register = mode === 'register';
+  for (const b of $$('.auth-tab')) b.setAttribute('aria-selected', String(b.dataset.mode === mode));
+  $('#field-name').hidden = !register;
+  $('#join-name').required = register;
+  $('#field-code').hidden = !register || !state.config?.needsCode;
+  $('#join-code').required = !$('#field-code').hidden;
+  $('#join-pass').autocomplete = register ? 'new-password' : 'current-password';
+  $('#join-pass').minLength = register ? 6 : 0;
+  showJoinError('');
+  setJoinBusy(false);
 }
 
-function renderJoinIdentity() {
-  const d = state.discord;
-  $('#join-discord').hidden = !state.config.discord || !!d;
-  $('#join-identity').hidden = !d;
-  $('#join-name-field').hidden = !!d;
-  $('#join-name').required = !d;
-  if (!d) return;
-  paintAvatar($('#join-identity .avatar'), d);
-  $('#join-identity .identity-name').textContent = d.name;
-  $('#join-identity .identity-sub').textContent = `@${d.username} · Discord`;
+async function onJoinSubmit(event) {
+  event.preventDefault();
+  state.micOn = $('#join-mic').checked;
+  store.set('joinMic', state.micOn);
+  store.set('joinCam', $('#join-cam').checked);
+  const email = $('#join-email').value.trim();
+  const body = { email, password: $('#join-pass').value };
+  if (authMode === 'register') Object.assign(body, { name: $('#join-name').value.trim(), code: $('#join-code').value });
+  setJoinBusy(true);
+  showJoinError('');
+  try {
+    const res = await fetch(`/api/auth/${authMode}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.errorDescription || `Erro ${res.status}`);
+    state.account = data;
+  } catch (err) {
+    setJoinBusy(false);
+    return showJoinError(err instanceof TypeError ? 'Sem conexão com o servidor.' : err.message);
+  }
+  store.set('email', email);
+  $('#join-pass').value = '';
+  $('#join-code').value = '';
+  unlockAudio();
+  enterWithAccount();
 }
 
-// O servidor devolve a pessoa com #discord=... quando o login não deu certo.
-function showDiscordResult() {
-  const result = /^#discord=(\w+)$/.exec(location.hash)?.[1];
-  if (!result) return;
-  history.replaceState(null, '', location.pathname + location.search);
-  if (DISCORD_RESULTS[result]) showJoinError(DISCORD_RESULTS[result]);
+function enterWithAccount() {
+  joinInfo = { startCam: store.get('joinCam', false) };
+  setJoinBusy(true);
+  connect();
+}
+
+async function logout() {
+  await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+  leave();
 }
 
 async function refreshPresence() {
@@ -196,25 +213,9 @@ function listNames(names) {
   return `${names.slice(0, 3).join(', ')} e mais ${names.length - 3}`;
 }
 
-function onJoinSubmit(event) {
-  event.preventDefault();
-  const name = state.discord ? state.discord.name : $('#join-name').value.trim().slice(0, 32);
-  if (!name) return showJoinError('Digite seu nome.');
-  if (!state.discord) store.set('name', name);
-  state.micOn = $('#join-mic').checked;
-  store.set('joinMic', state.micOn);
-  const startCam = $('#join-cam').checked;
-  store.set('joinCam', startCam);
-  joinInfo = { name, password: $('#join-pass').value, startCam };
-  unlockAudio();
-  setJoinBusy(true);
-  showJoinError('');
-  connect();
-}
-
 function setJoinBusy(busy) {
   $('#join-btn').disabled = busy;
-  $('#join-btn').textContent = busy ? 'Entrando…' : 'Entrar na sala';
+  $('#join-btn').textContent = busy ? 'Entrando…' : authMode === 'register' ? 'Criar conta e entrar' : 'Entrar';
 }
 
 function showJoinError(text) {
@@ -235,8 +236,6 @@ function connect() {
     reconnectDelay = 1000;
     send({
       type: 'join',
-      name: joinInfo.name,
-      password: joinInfo.password,
       micOn: state.micOn,
       deafened: state.deafened,
       resume: state.me,
@@ -275,11 +274,26 @@ function onMessage(msg) {
     case 'welcome':
       return onWelcome(msg);
     case 'error':
+      // Login expirado ou trocado: volta para a tela de entrar.
+      if (msg.code === 'auth' && state.inRoom) {
+        state.leaving = true;
+        return location.reload();
+      }
+      if (msg.code === 'auth') {
+        state.account = null;
+        setAuthMode('login');
+      }
       if (!state.inRoom) {
         setJoinBusy(false);
         showJoinError(msg.message);
       } else toast(msg.message);
       return;
+    case 'logout':
+      state.leaving = true;
+      toast(msg.text, { timeout: 15000 });
+      return setTimeout(() => location.reload(), 3000);
+    case 'directory':
+      return onDirectory(msg);
     case 'pong':
       return onPong(msg);
     case 'notice':
@@ -369,6 +383,8 @@ function onWelcome(msg) {
   }
   state.participants = new Map(msg.state.participants.map((p) => [p.id, p]));
   state.streams = new Map(msg.state.streams.map((s) => [s.id, s]));
+  state.account = { id: msg.you.userId, email: msg.you.email, name: msg.you.name, admin: msg.you.admin };
+  state.servers = new Map(msg.state.servers.map((s) => [s.id, s]));
   state.channels = new Map(msg.state.channels.map((c) => [c.id, c]));
   state.musics = new Map(Object.entries(msg.state.musics));
   state.files = new Map(msg.state.files.map((f) => [f.id, f]));
@@ -451,7 +467,7 @@ function enterRoom() {
   $('#files-hint').textContent = `Clique ou arraste aqui. Até ${state.config.fileMaxGB} GB cada; somem em ${state.config.fileTtlHours} h.`;
   new ResizeObserver(layoutGrid).observe($('#grid'));
 
-  // Como no Discord: entra na sala sem estar em nenhuma sala de voz; o microfone liga ao clicar numa.
+  // Entra na sala sem estar em nenhuma sala de voz; o microfone liga ao clicar numa.
   if (!state.config.realtimeReady) {
     state.micOn = false;
     sendState();
@@ -1246,20 +1262,10 @@ function initials(name = '?') {
   return ((parts[0]?.[0] || '?') + (parts.length > 1 ? parts.at(-1)[0] : '')).toUpperCase();
 }
 
-// Foto do Discord quando a pessoa entrou por ele; senão (ou se a foto não carregar), as iniciais.
-function paintAvatar(el, { name, color, avatar }) {
+// As iniciais da pessoa na cor dela.
+function paintAvatar(el, { name, color }) {
   if (color) el.style.setProperty('--c', color);
-  const key = `${avatar || ''}|${name}`;
-  if (el.dataset.key === key) return;
-  el.dataset.key = key;
   el.textContent = initials(name);
-  if (!avatar) return;
-  const img = document.createElement('img');
-  img.alt = '';
-  img.referrerPolicy = 'no-referrer';
-  img.addEventListener('error', () => (el.textContent = initials(name)), { once: true });
-  img.src = avatar;
-  el.replaceChildren(img);
 }
 
 // ---------- render ----------
@@ -1646,24 +1652,91 @@ const chatViews = []; // o canal de texto no meio da tela e o chat da sala de vo
 const readUpTo = new Map();
 const INLINE_IMAGE = /^image\/(png|jpeg|gif|webp|avif)$/;
 
-function sortedChannels(kind) {
-  return [...state.channels.values()].filter((c) => c.kind === kind).sort((a, b) => a.createdAt - b.createdAt);
+// ---------- servidores ----------
+
+function sortedServers() {
+  return [...state.servers.values()].sort((a, b) => Number(b.open) - Number(a.open) || a.createdAt - b.createdAt);
+}
+
+function currentServer() {
+  return state.servers.get(state.server) || sortedServers()[0];
+}
+
+function selectServer(id) {
+  if (!state.servers.has(id)) return;
+  state.server = id;
+  store.set('server', id);
+  toggleServerMenu(false);
+  renderAll();
+}
+
+function toggleServerMenu(open = $('#server-menu').hidden) {
+  $('#server-menu').hidden = !open;
+  $('#server-head').setAttribute('aria-expanded', String(open));
+  if (open) renderServerMenu();
+}
+
+function renderServerMenu() {
+  const current = currentServer();
+  const items = sortedServers().map((s) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'server-item';
+    b.dataset.server = s.id;
+    b.innerHTML = `<span class="server-item-name"></span>${s.id === current?.id ? icon('check') : ''}`;
+    $('.server-item-name', b).textContent = s.name;
+    return b;
+  });
+  if (state.account?.admin) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'server-item muted';
+    b.dataset.adminPanel = '1';
+    b.innerHTML = `${icon('plus')}<span class="server-item-name">Criar servidor ou mudar membros</span>`;
+    items.push(b);
+  }
+  $('#server-menu').replaceChildren(...items);
+}
+
+// O admin mexeu em servidores ou membros: chega a lista nova do que esta conta enxerga.
+function onDirectory(d) {
+  state.servers = new Map(d.servers.map((s) => [s.id, s]));
+  state.channels = new Map(d.channels.map((c) => [c.id, c]));
+  state.musics = new Map(Object.entries(d.musics));
+  for (const id of [...chats.keys()]) if (!state.channels.has(id)) chats.delete(id);
+  for (const view of chatViews) if (view.channelId && !state.channels.has(view.channelId)) view.channelId = null;
+  if (state.voice && !state.channels.has(state.voice)) leaveVoice({ notify: false });
+  syncMusic();
+  renderAll();
+  renderAdmin();
+}
+
+// ---------- canais ----------
+
+function sortedChannels(kind, serverId = currentServer()?.id) {
+  return [...state.channels.values()].filter((c) => c.kind === kind && c.serverId === serverId).sort((a, b) => a.createdAt - b.createdAt);
 }
 
 function channelLabel(ch) {
   return ch.kind === 'text' ? `#${ch.name}` : ch.name;
 }
 
-// O canal de texto aberto (ou a sala de voz em que estou, se foi ela que a pessoa abriu).
+// O canal de texto aberto (ou a sala de voz em que estou, se foi ela que a pessoa abriu), no servidor aberto.
 function currentView() {
   const ch = state.channels.get(state.view);
-  if (ch && (ch.kind === 'text' || ch.id === state.voice)) return ch;
+  if (ch && ch.serverId === currentServer()?.id && (ch.kind === 'text' || ch.id === state.voice)) return ch;
   return sortedChannels('text')[0];
 }
 
 function showView(id) {
+  const ch = state.channels.get(id);
+  if (!ch) return;
   state.view = id;
-  if (state.channels.get(id)?.kind === 'text') store.set('view', id);
+  if (ch.serverId !== state.server) {
+    state.server = ch.serverId;
+    store.set('server', ch.serverId);
+  }
+  if (ch.kind === 'text') store.set('view', id);
   renderAll();
 }
 
@@ -1748,9 +1821,15 @@ function renderChannels() {
     return group;
   });
   $('#channel-list').replaceChildren(...groups);
+  $('#server-name').textContent = currentServer()?.name || '';
+  // Só vale a pena abrir a lista quando há mais de um servidor ou quando é o admin.
+  $('#server-head').disabled = state.servers.size < 2 && !state.account?.admin;
   const voice = state.channels.get(state.voice);
   $('#voice-status').hidden = !voice;
-  if (voice) $('#voice-status-name').textContent = voice.name;
+  if (voice) {
+    const where = voice.serverId !== currentServer()?.id ? ` · ${state.servers.get(voice.serverId)?.name || ''}` : '';
+    $('#voice-status-name').textContent = `${voice.name}${where}`;
+  }
 }
 
 function onChannelRemoved(id) {
@@ -2195,7 +2274,7 @@ function bindChannels() {
     const name = $('#channel-name').value.trim();
     if (!name) return;
     if (channelEditing.id) send({ type: 'channel:update', id: channelEditing.id, name });
-    else send({ type: 'channel:create', kind: channelEditing.kind, name });
+    else send({ type: 'channel:create', kind: channelEditing.kind, name, serverId: currentServer()?.id });
     $('#channel-dialog').close();
   });
   $('#channel-cancel').addEventListener('click', () => $('#channel-dialog').close());
@@ -2206,6 +2285,21 @@ function bindChannels() {
     if (!confirm(`Apagar ${channelLabel(ch)}${extra}? Não dá para desfazer.`)) return;
     send({ type: 'channel:delete', id: ch.id });
     $('#channel-dialog').close();
+  });
+  $('#server-head').addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleServerMenu();
+  });
+  $('#server-menu').addEventListener('click', (e) => {
+    const item = e.target.closest('[data-server]');
+    if (item) return selectServer(item.dataset.server);
+    if (e.target.closest('[data-admin-panel]')) {
+      toggleServerMenu(false);
+      openAdmin();
+    }
+  });
+  document.addEventListener('click', (e) => {
+    if (!$('#server-menu').hidden && !e.target.closest('#server-menu, #server-head')) toggleServerMenu(false);
   });
   $('#voice-status-leave').addEventListener('click', () => leaveVoice());
   $('#btn-channels').addEventListener('click', () => $('#room').classList.toggle('channels-open'));
@@ -2225,6 +2319,156 @@ function bindChannels() {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible' || !state.inRoom) return;
     for (const view of chatViews) if (view.channelId && isChatVisible(view.channelId)) markRead(view.channelId);
+  });
+}
+
+// ---------- painel de admin ----------
+
+let adminUsers = [];
+let adminExpanded = null; // servidor com a lista de membros aberta
+
+async function adminApi(method, path, body) {
+  let res;
+  try {
+    res = await fetch(`/api/admin${path}`, {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new Error('Sem conexão com o servidor.');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.errorDescription || `Erro ${res.status}`);
+  return data;
+}
+
+async function adminAction(task) {
+  $('#admin-error').textContent = '';
+  try {
+    await task();
+  } catch (err) {
+    $('#admin-error').textContent = err.message;
+  }
+}
+
+async function openAdmin() {
+  if (!state.account?.admin) return;
+  $('#admin-dialog').showModal();
+  await adminAction(async () => {
+    adminUsers = await adminApi('GET', '/users');
+  });
+  renderAdmin();
+}
+
+function renderAdmin() {
+  if (!$('#admin-dialog').open) return;
+  $('#admin-servers').replaceChildren(
+    ...sortedServers().map((s) => {
+      const li = document.createElement('li');
+      li.className = 'admin-item';
+      li.dataset.server = s.id;
+      const extra = s.open
+        ? ''
+        : `<button class="btn secondary small" type="button" data-act="members">Membros</button><button class="icon-btn sm" type="button" data-act="delete" aria-label="Apagar servidor" title="Apagar servidor">${icon('trash')}</button>`;
+      li.innerHTML = `<div class="admin-row"><div class="admin-main"><div class="admin-name"></div><div class="admin-sub"></div></div><button class="btn secondary small" type="button" data-act="rename">Renomear</button>${extra}</div>`;
+      $('.admin-name', li).textContent = s.name;
+      $('.admin-sub', li).textContent = s.open ? 'Aberto a todas as contas' : `${s.members.length} ${s.members.length === 1 ? 'membro' : 'membros'} além de você`;
+      if (adminExpanded === s.id && !s.open) {
+        const box = document.createElement('div');
+        box.className = 'admin-members';
+        for (const u of adminUsers) {
+          if (u.admin) continue;
+          const label = document.createElement('label');
+          label.className = 'toggle-row';
+          label.innerHTML = '<span class="toggle-text"></span><input type="checkbox" class="switch">';
+          $('.toggle-text', label).textContent = `${u.name} · ${u.email}`;
+          $('input', label).checked = s.members.includes(u.id);
+          $('input', label).dataset.user = u.id;
+          box.append(label);
+        }
+        if (!box.children.length) box.textContent = 'Ninguém além de você tem conta ainda.';
+        li.append(box);
+      }
+      return li;
+    }),
+  );
+  $('#admin-users').replaceChildren(
+    ...adminUsers.map((u) => {
+      const li = document.createElement('li');
+      li.className = 'admin-item';
+      li.dataset.user = u.id;
+      const actions = u.admin
+        ? '<span class="admin-tag">admin</span>'
+        : `<button class="btn secondary small" type="button" data-act="password">Nova senha</button><button class="icon-btn sm" type="button" data-act="delete-user" aria-label="Apagar conta" title="Apagar conta">${icon('trash')}</button>`;
+      li.innerHTML = `<div class="admin-row"><div class="admin-main"><div class="admin-name"></div><div class="admin-sub"></div></div>${actions}</div>`;
+      $('.admin-name', li).textContent = u.name;
+      $('.admin-sub', li).textContent = u.email;
+      return li;
+    }),
+  );
+}
+
+function bindAdmin() {
+  $('#admin-close').addEventListener('click', () => $('#admin-dialog').close());
+  $('#btn-admin').addEventListener('click', () => {
+    $('#settings').close();
+    openAdmin();
+  });
+  $('#server-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = $('#server-new').value.trim();
+    if (!name) return;
+    adminAction(async () => {
+      const s = await adminApi('POST', '/servers', { name });
+      $('#server-new').value = '';
+      // Já abre a lista de membros do servidor novo; a lista nova de servidores chega pelo WebSocket.
+      adminExpanded = s.id;
+      renderAdmin();
+    });
+  });
+  $('#admin-servers').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-act]');
+    const s = state.servers.get(e.target.closest('[data-server]')?.dataset.server);
+    if (!b || !s) return;
+    if (b.dataset.act === 'rename') {
+      const name = prompt('Nome novo do servidor:', s.name)?.trim();
+      if (name && name !== s.name) adminAction(() => adminApi('PUT', `/servers/${s.id}`, { name }));
+    } else if (b.dataset.act === 'members') {
+      adminExpanded = adminExpanded === s.id ? null : s.id;
+      renderAdmin();
+    } else if (b.dataset.act === 'delete' && confirm(`Apagar o servidor ${s.name}, com todos os canais, mensagens e imagens dele? Não dá para desfazer.`)) {
+      adminAction(() => adminApi('DELETE', `/servers/${s.id}`));
+    }
+  });
+  $('#admin-servers').addEventListener('change', (e) => {
+    const box = e.target.closest('input[data-user]');
+    const s = state.servers.get(e.target.closest('[data-server]')?.dataset.server);
+    if (!box || !s) return;
+    const members = new Set(s.members);
+    if (box.checked) members.add(box.dataset.user);
+    else members.delete(box.dataset.user);
+    adminAction(() => adminApi('PUT', `/servers/${s.id}`, { members: [...members] }));
+  });
+  $('#admin-users').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-act]');
+    const u = adminUsers.find((x) => x.id === e.target.closest('[data-user]')?.dataset.user);
+    if (!b || !u) return;
+    if (b.dataset.act === 'password') {
+      const password = prompt(`Senha nova para ${u.name} (pelo menos 6 caracteres). Depois passe para a pessoa; ela pode trocar em Configurações.`);
+      if (password) {
+        adminAction(async () => {
+          await adminApi('POST', `/users/${u.id}/password`, { password });
+          toast(`Senha de ${u.name} trocada.`);
+        });
+      }
+    } else if (b.dataset.act === 'delete-user' && confirm(`Apagar a conta de ${u.name} (${u.email})? As mensagens dela continuam nos canais.`)) {
+      adminAction(async () => {
+        await adminApi('DELETE', `/users/${u.id}`);
+        adminUsers = await adminApi('GET', '/users');
+        renderAdmin();
+      });
+    }
   });
 }
 
@@ -2613,7 +2857,9 @@ function renderSoundpad() {
     b.dataset.sound = s.id;
     const mine = !s.builtin && (s.ownerId === state.me.id || s.ownerName === myName);
     b.classList.toggle('mine', mine);
-    b.title = s.builtin ? s.name : `${s.name} (de ${s.ownerName})`;
+    b.classList.toggle('removable', !s.builtin && !!state.account?.admin);
+    const length = s.duration > 15 ? ` · ${fmtDuration(s.duration)}` : '';
+    b.title = s.builtin ? s.name : `${s.name} (de ${s.ownerName}${length})`;
     b.innerHTML = '<span class="sound-emoji"></span><span class="sound-name"></span>';
     $('.sound-emoji', b).textContent = s.emoji;
     $('.sound-name', b).textContent = s.name;
@@ -2654,10 +2900,10 @@ function openSoundDialog() {
   $('#sound-dialog').showModal();
 }
 
-// Confere se o arquivo é um áudio que o navegador entende e se é curto.
+// Confere se o arquivo é um áudio que o navegador entende e se tem até 3 minutos.
 async function checkSoundFile(file) {
   if (!file) throw new Error('Escolha um arquivo de áudio.');
-  if (file.size > 2 * 1024 * 1024) throw new Error('O arquivo passa de 2 MB. Corte um trecho menor.');
+  if (file.size > 100 * 1024 * 1024) throw new Error('O arquivo é grande demais. Use um MP3 de até 3 minutos.');
   unlockAudio();
   let buffer;
   try {
@@ -2665,8 +2911,13 @@ async function checkSoundFile(file) {
   } catch {
     throw new Error('Esse arquivo não parece ser um áudio que o navegador entende. Tente MP3 ou WAV.');
   }
-  if (buffer.duration > 15.5) throw new Error(`O som tem ${Math.round(buffer.duration)} s; o máximo é 15 s.`);
+  if (buffer.duration > SOUND_MAX_SECONDS + 0.5) throw new Error(`O som tem ${fmtDuration(buffer.duration)}; o máximo é 3 minutos.`);
   return buffer;
+}
+
+function fmtDuration(seconds) {
+  const s = Math.round(seconds);
+  return s < 60 ? `${s} s` : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} min`;
 }
 
 function bindSoundpad() {
@@ -2690,7 +2941,7 @@ function bindSoundpad() {
     b.classList.add('pulse');
   });
   $('#soundpad-grid').addEventListener('contextmenu', (e) => {
-    const b = e.target.closest('.sound-btn.mine');
+    const b = e.target.closest('.sound-btn.removable');
     if (!b) return;
     e.preventDefault();
     onSoundRightClick(b.dataset.sound);
@@ -2725,17 +2976,20 @@ function bindSoundpad() {
     if (!name) return ($('#sound-error').textContent = 'Dê um nome para o botão.');
     $('#sound-save').disabled = true;
     try {
-      await checkSoundFile(file);
+      const buffer = await checkSoundFile(file);
       const ext = file.name.split('.').pop().toLowerCase();
+      // Arquivo grande (WAV longo, por exemplo) vira um WAV menor antes de subir.
+      const body = file.size > SOUND_MAX_BYTES ? await compactWav(buffer) : file;
       const res = await fetch('/api/sounds', {
         method: 'POST',
         headers: {
           Authorization: authHeader(),
-          'Content-Type': file.type || `audio/${ext === 'mp3' ? 'mpeg' : ext}`,
+          'Content-Type': body.type || `audio/${ext === 'mp3' ? 'mpeg' : ext}`,
           'X-Sound-Name': encodeURIComponent(name),
           'X-Sound-Emoji': encodeURIComponent($('#sound-emoji').value.trim()),
+          'X-Sound-Duration': buffer.duration.toFixed(1),
         },
-        body: file,
+        body,
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.errorDescription || `Erro ${res.status} ao enviar o som.`);
@@ -2752,6 +3006,12 @@ function bindSoundpad() {
 
 async function openSettings() {
   $('#set-name').value = state.participants.get(state.me.id)?.name || '';
+  $('#set-email').textContent = `Conta: ${state.account?.email || ''}${state.account?.admin ? ' (admin)' : ''}`;
+  // A senha do admin fica no .env do servidor.
+  $('#pw-change').hidden = !!state.account?.admin;
+  $('#pw-change').open = false;
+  $('#pw-error').textContent = '';
+  $('#btn-admin').hidden = !state.account?.admin;
   $('#set-noise').checked = settings.noise;
   $('#set-quality').value = settings.quality;
   $('#set-autowatch').checked = settings.autoWatch;
@@ -2780,11 +3040,28 @@ function bindSettings() {
   $('#set-name').addEventListener('change', (e) => {
     const name = e.target.value.trim().slice(0, 32);
     if (!name) return;
-    store.set('name', name);
-    if (joinInfo) joinInfo.name = name;
-    // Sem Discord, quem escreveu é reconhecido pelo nome.
-    if (state.me?.author?.startsWith('n:')) state.me.author = `n:${name.toLowerCase()}`;
+    if (state.account) state.account.name = name;
     send({ type: 'update', name });
+  });
+  $('#pw-save').addEventListener('click', async () => {
+    const error = $('#pw-error');
+    error.textContent = '';
+    try {
+      const res = await fetch('/api/auth/password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current: $('#pw-current').value, password: $('#pw-new').value }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.errorDescription || `Erro ${res.status}`);
+    } catch (err) {
+      error.textContent = err instanceof TypeError ? 'Sem conexão com o servidor.' : err.message;
+      return;
+    }
+    $('#pw-current').value = '';
+    $('#pw-new').value = '';
+    $('#pw-change').open = false;
+    toast('Senha trocada. Nos outros aparelhos, entre de novo com a senha nova.');
   });
   $('#set-mic').addEventListener('change', async (e) => {
     settings.micId = e.target.value;
@@ -2850,7 +3127,7 @@ function bindRoomUi() {
   $('#btn-cam').addEventListener('click', toggleCamera);
   $('#btn-screen').addEventListener('click', startScreen);
   $('#btn-leave').addEventListener('click', () => leaveVoice());
-  $('#btn-exit').addEventListener('click', leave);
+  $('#btn-exit').addEventListener('click', logout);
   $('#btn-settings').addEventListener('click', openSettings);
   $('#btn-side').addEventListener('click', () => {
     const hidden = $('#room').classList.toggle('side-hidden');
@@ -2867,6 +3144,7 @@ function bindRoomUi() {
   $('#people').addEventListener('click', onPeopleClick);
   $('#people').addEventListener('input', onPeopleInput);
   bindChannels();
+  bindAdmin();
 
   $('#music-form').addEventListener('submit', (e) => {
     e.preventDefault();

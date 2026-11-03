@@ -1,7 +1,7 @@
 // Servidor da Sala Privada: entrega o site, faz a sinalização por WebSocket
 // (quem está na sala, o que está no ar, chat, música e arquivos) e repassa as
 // chamadas para o Cloudflare Realtime. O segredo do app do Realtime nunca sai daqui.
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { appendFile, mkdir, readdir, readFile, statfs, truncate, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -9,6 +9,7 @@ import path from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 
@@ -16,11 +17,10 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.PORT) || 8380;
 const APP_ID = (process.env.REALTIME_APP_ID || '').trim();
 const APP_SECRET = (process.env.REALTIME_APP_SECRET || '').trim();
+// Pedida uma vez só, para criar conta. Vazio = qualquer pessoa com o link cria conta.
 const ROOM_PASSWORD = process.env.ROOM_PASSWORD || '';
-const DISCORD_ID = (process.env.DISCORD_CLIENT_ID || '').trim();
-const DISCORD_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
-const DISCORD_API = 'https://discord.com/api/v10';
-const DISCORD_DAYS = 30;
+const ADMIN_EMAIL = cleanEmail(process.env.ADMIN_EMAIL);
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const LIMIT_GB = Number(process.env.MONTHLY_LIMIT_GB) || 900;
 const FILE_TTL_HOURS = Number(process.env.FILE_TTL_HOURS) || 24;
 const FILE_MAX_GB = Number(process.env.FILE_MAX_GB) || 10;
@@ -31,8 +31,14 @@ const FILES_DIR = path.join(DATA_DIR, 'files');
 const FILES_INDEX = path.join(DATA_DIR, 'files.json');
 const SOUNDS_DIR = path.join(DATA_DIR, 'sounds');
 const SOUNDS_INDEX = path.join(DATA_DIR, 'sounds.json');
-const SOUND_MAX_BYTES = 2 * 1024 * 1024;
+const SOUND_MAX_BYTES = 10 * 1024 * 1024;
+const SOUND_MAX_SECONDS = 180;
 const SOUNDS_MAX = 200;
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const LOGINS_FILE = path.join(DATA_DIR, 'sessions.json');
+const SERVERS_FILE = path.join(DATA_DIR, 'servers.json');
+const SESSION_DAYS = 180;
+const MAIN_SERVER = 'principal'; // o servidor aberto a todas as contas
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const ATTACH_DIR = path.join(DATA_DIR, 'attachments');
@@ -109,6 +115,7 @@ function log(level, who, text, action, key) {
 setInterval(() => {
   const cutoff = Date.now() - 10 * 60_000;
   for (const [key, seen] of logSeen) if (seen.at < cutoff) logSeen.delete(key);
+  for (const [ip, f] of failures) if (f.until < Date.now()) failures.delete(ip);
 }, 10 * 60_000);
 
 const who = (p) => (p ? `${p.name} (${p.device})` : '');
@@ -185,7 +192,10 @@ const sessions = new Map(); // sessionId do Realtime -> id do participante dono
 const stallReports = new Map(); // id da transmissão -> Map(id de quem reclamou -> quando)
 const files = new Map();
 const sounds = new Map();
-const channels = new Map(); // id -> { id, kind: 'text' | 'voice', name, createdAt, createdBy }
+const users = new Map(); // id -> { id, email, name, passHash, createdAt }
+const logins = new Map(); // token do cookie de login -> { userId, createdAt }
+const servers = new Map(); // id -> { id, name, createdAt, members: [ids das contas] | null (aberto a todos) }
+const channels = new Map(); // id -> { id, serverId, kind: 'text' | 'voice', name, createdAt, createdBy }
 const messages = new Map(); // id do canal -> mensagens em ordem (ficam salvas em data/messages)
 const attachments = new Map(); // id do anexo -> dados, só dos que já estão numa mensagem
 const pendingUploads = new Map(); // anexos enviados que ainda não foram para nenhuma mensagem
@@ -198,7 +208,6 @@ function publicParticipant(p) {
     id: p.id,
     name: p.name,
     color: p.color,
-    avatar: p.avatar,
     voice: p.voice,
     micOn: p.micOn,
     deafened: p.deafened,
@@ -207,12 +216,11 @@ function publicParticipant(p) {
   };
 }
 
-function snapshot() {
+function snapshot(p) {
   return {
     participants: [...participants.values()].map(publicParticipant),
     streams: [...streams.values()],
-    channels: [...channels.values()].map(publicChannel),
-    musics: Object.fromEntries([...musics].map(([id, m]) => [id, musicState(m)])),
+    ...directoryFor(p),
     usage: usageInfo(),
     files: [...files.values()].filter((f) => f.complete).map(publicFile),
     sounds: allSounds(),
@@ -227,6 +235,14 @@ function broadcast(msg, exceptId) {
   const data = JSON.stringify(msg);
   for (const p of participants.values()) {
     if (p.id !== exceptId && p.ws?.readyState === 1) p.ws.send(data);
+  }
+}
+
+// Só para quem enxerga o canal (servidores novos têm membros escolhidos pelo admin).
+function broadcastChannel(channelId, msg) {
+  const data = JSON.stringify(msg);
+  for (const p of participants.values()) {
+    if (canSeeChannel(p, channelId) && p.ws?.readyState === 1) p.ws.send(data);
   }
 }
 
@@ -250,9 +266,14 @@ function colorFor(name) {
   return COLORS[hash % COLORS.length];
 }
 
-// Quem escreveu, de um jeito que sobrevive a reconexões: a conta do Discord, ou o nome.
+// Quem escreveu, de um jeito que sobrevive a reconexões: a conta.
 function authorKey(p) {
-  return p.discordId ? `d:${p.discordId}` : `n:${p.name.toLowerCase()}`;
+  return `u:${p.userId}`;
+}
+
+// Mensagens de antes das contas guardam o nome de quem escreveu.
+function isAuthor(p, m) {
+  return m.author === authorKey(p) || m.author === `n:${p.name.toLowerCase()}`;
 }
 
 function describeStream(s) {
@@ -279,14 +300,15 @@ function describeTracks(tracks) {
 // ---------- entrada e saída ----------
 
 function handleJoin(ws, msg) {
-  if (ROOM_PASSWORD && msg.password !== ROOM_PASSWORD) {
-    return send(ws, { type: 'error', code: 'password', message: 'Senha incorreta.' });
+  // A conta vem do cookie de login, conferido quando a conexão abriu.
+  const user = users.get(ws.userId);
+  if (!user) {
+    return send(ws, { type: 'error', code: 'auth', message: 'Entre com o seu e-mail e senha. Se a página for antiga, aperte F5.' });
   }
-  const name = cleanName(msg.name) || ws.discord?.name;
-  if (!name) return send(ws, { type: 'error', code: 'name', message: 'Escolha um nome.' });
+  const name = user.name;
 
   let p = msg.resume ? participants.get(msg.resume.id) : null;
-  const resumed = !!p && p.token === msg.resume.token;
+  const resumed = !!p && p.token === msg.resume.token && p.userId === user.id;
   if (resumed) {
     clearTimeout(p.leaveTimer);
     p.leaveTimer = null;
@@ -298,14 +320,15 @@ function handleJoin(ws, msg) {
   p.ws = ws;
   p.online = true;
   p.name = name;
-  p.avatar = ws.discord?.avatar || null;
-  p.discordId = ws.discord?.id || null;
+  p.userId = user.id;
+  p.admin = isAdmin(user);
   p.device = ws.device;
   p.micOn = !!msg.micOn;
   p.deafened = !!msg.deafened;
   ws.pid = p.id;
 
-  send(ws, { type: 'welcome', resumed, version: APP_VERSION, you: { id: p.id, token: p.token, author: authorKey(p) }, state: snapshot() });
+  const you = { ...publicUser(user), userId: user.id, id: p.id, token: p.token, author: authorKey(p) };
+  send(ws, { type: 'welcome', resumed, version: APP_VERSION, you, state: snapshot(p) });
   if (msg.version !== APP_VERSION) {
     log(
       'AVISO',
@@ -322,8 +345,7 @@ function handleJoin(ws, msg) {
     log('INFO', who(p), 'reconectou ao servidor');
   } else {
     broadcast({ type: 'participant:joined', participant: publicParticipant(p) }, p.id);
-    const via = ws.discord ? ` com o Discord (@${ws.discord.username})` : '';
-    log('INFO', who(p), `entrou na sala${via} (${participants.size} ${participants.size === 1 ? 'pessoa' : 'pessoas'} agora)`);
+    log('INFO', who(p), `entrou na sala (${participants.size} ${participants.size === 1 ? 'pessoa' : 'pessoas'} agora)`);
   }
 }
 
@@ -401,9 +423,9 @@ function musicState(m) {
   return { queue: m.queue, current: m.current, playing: m.playing, position: musicPosition(m), serverTime: Date.now() };
 }
 
-// Vai para todo mundo: a lista de canais mostra onde tem música tocando.
+// Vai para todo mundo que enxerga a sala: a lista de canais mostra onde tem música tocando.
 function broadcastMusic(channelId) {
-  broadcast({ type: 'music', channelId, music: musicState(musicOf(channelId)) });
+  broadcastChannel(channelId, { type: 'music', channelId, music: musicState(musicOf(channelId)) });
 }
 
 function playItem(channelId, item) {
@@ -580,7 +602,7 @@ async function sweepFiles() {
 // ---------- mesa de sons ----------
 
 function publicSound(s) {
-  return { id: s.id, name: s.name, emoji: s.emoji, ownerId: s.ownerId, ownerName: s.ownerName, url: `/api/sounds/${s.id}`, builtin: false };
+  return { id: s.id, name: s.name, emoji: s.emoji, duration: s.duration || 0, ownerId: s.ownerId, ownerName: s.ownerName, url: `/api/sounds/${s.id}`, builtin: false };
 }
 
 function allSounds() {
@@ -604,12 +626,185 @@ async function loadSounds() {
   }
 }
 
+// ---------- contas ----------
+// Cada pessoa entra com e-mail e senha. A senha só fica guardada como hash (scrypt) em data/users.json;
+// quem entra ganha um cookie com um token guardado em data/sessions.json. A conta de admin vem do .env.
+
+const scryptAsync = promisify(scrypt);
+
+function cleanEmail(email) {
+  return String(email ?? '').trim().toLowerCase().slice(0, 120);
+}
+
+const validEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+// O host é a conta do .env e só ele dá e tira o cargo de admin; quem recebe pode todo o resto.
+const isHost = (user) => !!user && !!ADMIN_EMAIL && user.email === ADMIN_EMAIL;
+const isAdmin = (user) => isHost(user) || !!user?.admin;
+const userByEmail = (email) => [...users.values()].find((u) => u.email === email);
+
+function publicUser(u) {
+  return { id: u.id, email: u.email, name: u.name, admin: isAdmin(u), host: isHost(u), createdAt: u.createdAt };
+}
+
+async function hashPassword(password) {
+  const salt = randomBytes(16);
+  const hash = await scryptAsync(String(password), salt, 64);
+  return `scrypt$${salt.toString('base64')}$${hash.toString('base64')}`;
+}
+
+async function checkPassword(password, stored) {
+  const [, salt, hash] = String(stored || '').split('$');
+  if (!salt || !hash) return false;
+  const expected = Buffer.from(hash, 'base64');
+  const got = await scryptAsync(String(password ?? ''), Buffer.from(salt, 'base64'), expected.length);
+  return timingSafeEqual(got, expected);
+}
+
+function saveUsers() {
+  return onDisk('as contas', () => writeFile(USERS_FILE, JSON.stringify([...users.values()])));
+}
+
+function saveLogins() {
+  return onDisk('os logins', () => writeFile(LOGINS_FILE, JSON.stringify([...logins])));
+}
+
+async function loadUsers() {
+  try {
+    for (const u of JSON.parse(await readFile(USERS_FILE, 'utf8'))) users.set(u.id, u);
+  } catch {
+    // ainda não há contas
+  }
+  const cutoff = Date.now() - SESSION_DAYS * 86_400_000;
+  try {
+    for (const [token, s] of JSON.parse(await readFile(LOGINS_FILE, 'utf8'))) {
+      if (users.has(s.userId) && s.createdAt > cutoff) logins.set(token, s);
+    }
+  } catch {
+    // ninguém entrou ainda
+  }
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return;
+  // A conta de admin é criada na primeira vez e a senha dela é sempre a do .env.
+  let admin = userByEmail(ADMIN_EMAIL);
+  if (!admin) {
+    admin = { id: newId(), email: ADMIN_EMAIL, name: cleanName(ADMIN_EMAIL.split('@')[0]) || 'Admin', createdAt: Date.now() };
+    users.set(admin.id, admin);
+    log('INFO', null, `conta de admin criada para ${ADMIN_EMAIL}`);
+  }
+  if (!(await checkPassword(ADMIN_PASSWORD, admin.passHash))) admin.passHash = await hashPassword(ADMIN_PASSWORD);
+  await saveUsers();
+}
+
+const isHttps = (req) => req.get('x-forwarded-proto') === 'https';
+
+function userFrom(req) {
+  const s = logins.get(readCookie(req, 'sala_login'));
+  if (!s || s.createdAt < Date.now() - SESSION_DAYS * 86_400_000) return null;
+  return users.get(s.userId) || null;
+}
+
+function startLogin(req, res, user) {
+  const token = newId(24);
+  logins.set(token, { userId: user.id, createdAt: Date.now() });
+  saveLogins();
+  res.cookie('sala_login', token, { httpOnly: true, sameSite: 'lax', secure: isHttps(req), path: '/', maxAge: SESSION_DAYS * 86_400_000 });
+}
+
+// Desconecta a conta em todos os aparelhos (menos o que pediu, se for o caso).
+function endLogins(userId, keepToken) {
+  for (const [token, s] of logins) if (s.userId === userId && token !== keepToken) logins.delete(token);
+  saveLogins();
+}
+
+function kickUser(userId, text) {
+  for (const p of [...participants.values()]) {
+    if (p.userId !== userId) continue;
+    send(p.ws, { type: 'logout', text });
+    removeParticipant(p);
+    p.ws?.close();
+  }
+}
+
+// Erros de senha por IP: depois de 10 em 10 minutos, espera.
+const failures = new Map();
+const clientIp = (req) => req.get('cf-connecting-ip') || req.socket.remoteAddress || '';
+
+function blocked(req) {
+  const f = failures.get(clientIp(req));
+  return !!f && f.until > Date.now() && f.count >= 10;
+}
+
+function failed(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  const f = failures.get(ip);
+  if (!f || f.until < now) failures.set(ip, { count: 1, until: now + 10 * 60_000 });
+  else if (++f.count === 10) log('AVISO', null, `10 senhas erradas seguidas vindas de ${ip}; esse endereço espera 10 minutos`, 'nada se foi alguém da sala esquecendo a senha (o admin pode trocar a senha da pessoa no painel)');
+}
+
+// ---------- servidores ----------
+// O servidor principal é aberto a todas as contas; nos outros, o admin escolhe quem entra.
+
+function publicServer(s) {
+  return { id: s.id, name: s.name, createdAt: s.createdAt, open: s.members === null, members: s.members || [] };
+}
+
+function canSee(p, serverId) {
+  const s = servers.get(serverId);
+  return !!s && (s.members === null || p.admin || s.members.includes(p.userId));
+}
+
+function canSeeChannel(p, channelId) {
+  const c = channels.get(channelId);
+  return !!c && canSee(p, c.serverId);
+}
+
+// Os servidores, canais e músicas que essa pessoa enxerga.
+function directoryFor(p) {
+  const visible = [...servers.values()].filter((s) => canSee(p, s.id));
+  const ids = new Set(visible.map((s) => s.id));
+  return {
+    servers: visible.map(publicServer),
+    channels: [...channels.values()].filter((c) => ids.has(c.serverId)).map(publicChannel),
+    musics: Object.fromEntries([...musics].filter(([id]) => ids.has(channels.get(id)?.serverId)).map(([id, m]) => [id, musicState(m)])),
+  };
+}
+
+// Depois que o admin mexe em servidores ou membros: quem perdeu acesso sai da sala de voz, e todos recebem a lista nova.
+function refreshDirectories() {
+  for (const p of participants.values()) {
+    if (p.voice && !canSeeChannel(p, p.voice)) moveVoice(p, null);
+    send(p.ws, { type: 'directory', ...directoryFor(p) });
+  }
+}
+
+function saveServers() {
+  return onDisk('a lista de servidores', () => writeFile(SERVERS_FILE, JSON.stringify([...servers.values()])));
+}
+
+async function loadServers() {
+  try {
+    for (const s of JSON.parse(await readFile(SERVERS_FILE, 'utf8'))) servers.set(s.id, s);
+  } catch {
+    // primeira vez: só o principal, logo abaixo
+  }
+  if (!servers.has(MAIN_SERVER)) servers.set(MAIN_SERVER, { id: MAIN_SERVER, name: 'Sala Privada', createdAt: Date.now(), members: null });
+  servers.get(MAIN_SERVER).members = null;
+  await saveServers();
+}
+
+function addChannel(serverId, kind, name, createdBy) {
+  const c = { id: newId(), serverId, kind, name, createdAt: Date.now(), createdBy };
+  channels.set(c.id, c);
+  messages.set(c.id, []);
+  return c;
+}
+
 // ---------- canais de texto e de voz ----------
 // Os canais e as mensagens ficam no disco (data/channels.json e data/messages/<canal>.jsonl,
 // uma mensagem por linha). Os anexos ficam em data/attachments e só somem se a mensagem for apagada.
 
 function publicChannel(c) {
-  return { id: c.id, kind: c.kind, name: c.name, createdAt: c.createdAt, lastTs: messages.get(c.id)?.at(-1)?.ts || 0 };
+  return { id: c.id, serverId: c.serverId, kind: c.kind, name: c.name, createdAt: c.createdAt, lastTs: messages.get(c.id)?.at(-1)?.ts || 0 };
 }
 
 const messagesFile = (channelId) => path.join(MESSAGES_DIR, `${channelId}.jsonl`);
@@ -639,15 +834,16 @@ async function loadChannels() {
   await mkdir(ATTACH_DIR, { recursive: true });
   try {
     for (const c of JSON.parse(await readFile(CHANNELS_FILE, 'utf8'))) {
-      if (/^[\w-]{1,32}$/.test(c.id) && (c.kind === 'text' || c.kind === 'voice')) channels.set(c.id, c);
+      if (!/^[\w-]{1,32}$/.test(c.id) || (c.kind !== 'text' && c.kind !== 'voice')) continue;
+      // Canais de antes dos servidores (ou de um servidor que sumiu) ficam no principal.
+      if (!servers.has(c.serverId)) c.serverId = MAIN_SERVER;
+      channels.set(c.id, c);
     }
   } catch {
     // primeira vez: cria os canais padrão logo abaixo
   }
   for (const [kind, name] of [['text', 'geral'], ['voice', 'Geral']]) {
-    if ([...channels.values()].some((c) => c.kind === kind)) continue;
-    const c = { id: newId(), kind, name, createdAt: Date.now(), createdBy: null };
-    channels.set(c.id, c);
+    if (![...channels.values()].some((c) => c.serverId === MAIN_SERVER && c.kind === kind)) addChannel(MAIN_SERVER, kind, name, null);
   }
   await saveChannels();
   for (const c of channels.values()) {
@@ -665,7 +861,7 @@ async function loadChannels() {
       // canal ainda sem mensagens
     }
     messages.set(c.id, list);
-    for (const m of list) for (const a of m.attachments || []) attachments.set(a.id, a);
+    for (const m of list) for (const a of m.attachments || []) attachments.set(a.id, { ...a, channelId: c.id });
   }
   // Sobras de canais apagados e de envios que não viraram mensagem.
   for (const name of await readdir(MESSAGES_DIR)) {
@@ -678,15 +874,15 @@ async function loadChannels() {
 
 function addMessage(m) {
   messages.get(m.channelId).push(m);
-  for (const a of m.attachments) attachments.set(a.id, a);
-  broadcast({ type: 'chat', message: m });
+  for (const a of m.attachments) attachments.set(a.id, { ...a, channelId: m.channelId });
+  broadcastChannel(m.channelId, { type: 'chat', message: m });
   onDisk('uma mensagem', () => appendFile(messagesFile(m.channelId), `${JSON.stringify(m)}\n`));
 }
 
 function deleteMessage(channelId, index) {
   const [m] = messages.get(channelId).splice(index, 1);
   for (const a of m.attachments) attachments.delete(a.id);
-  broadcast({ type: 'chat:deleted', channelId, id: m.id });
+  broadcastChannel(channelId, { type: 'chat:deleted', channelId, id: m.id });
   rewriteMessages(channelId);
   onDisk('a remoção dos anexos', async () => {
     for (const a of m.attachments) await unlink(attachPath(a.id)).catch(() => {});
@@ -741,46 +937,55 @@ const handlers = {
   update(p, msg) {
     if (typeof msg.micOn === 'boolean') p.micOn = msg.micOn;
     if (typeof msg.deafened === 'boolean') p.deafened = msg.deafened;
-    if (msg.name !== undefined) {
-      const name = cleanName(msg.name);
-      if (name) p.name = name;
+    // O nome é o da conta: trocar aqui troca para sempre.
+    const name = msg.name !== undefined && cleanName(msg.name);
+    const user = users.get(p.userId);
+    if (name && user && name !== user.name) {
+      user.name = name;
+      saveUsers();
+      for (const other of participants.values()) {
+        if (other.userId !== user.id) continue;
+        other.name = name;
+        if (other !== p) broadcast({ type: 'participant:updated', participant: publicParticipant(other) });
+      }
     }
     broadcast({ type: 'participant:updated', participant: publicParticipant(p) });
   },
 
   'voice:join'(p, msg) {
     const id = msg.channelId ? String(msg.channelId) : null;
-    if (id && channels.get(id)?.kind !== 'voice') return send(p.ws, { type: 'voice:ended', text: 'Essa sala de voz não existe mais.' });
+    if (id && (channels.get(id)?.kind !== 'voice' || !canSeeChannel(p, id))) {
+      return send(p.ws, { type: 'voice:ended', text: 'Essa sala de voz não existe mais.' });
+    }
     moveVoice(p, id);
   },
 
   'channel:create'(p, msg) {
     const kind = msg.kind === 'voice' ? 'voice' : 'text';
     const name = cleanName(msg.name);
-    if (!name) return;
-    if (channels.size >= CHANNELS_MAX) return send(p.ws, { type: 'notice', text: `Já são ${CHANNELS_MAX} canais. Apague algum antes.` });
-    const c = { id: newId(), kind, name, createdAt: Date.now(), createdBy: p.name };
-    channels.set(c.id, c);
-    messages.set(c.id, []);
+    const serverId = String(msg.serverId ?? MAIN_SERVER);
+    if (!name || !canSee(p, serverId)) return;
+    if (channels.size >= CHANNELS_MAX * servers.size) return send(p.ws, { type: 'notice', text: 'Canais demais. Apague algum antes.' });
+    const c = addChannel(serverId, kind, name, p.name);
     saveChannels();
-    broadcast({ type: 'channel:added', channel: publicChannel(c), by: p.id });
-    log('INFO', who(p), `criou o canal de ${kind === 'voice' ? 'voz' : 'texto'} "${name}"`);
+    broadcastChannel(c.id, { type: 'channel:added', channel: publicChannel(c), by: p.id });
+    log('INFO', who(p), `criou o canal de ${kind === 'voice' ? 'voz' : 'texto'} "${name}" em ${servers.get(serverId).name}`);
   },
 
   'channel:update'(p, msg) {
     const c = channels.get(String(msg.id ?? ''));
     const name = cleanName(msg.name);
-    if (!c || !name || name === c.name) return;
+    if (!c || !name || name === c.name || !canSee(p, c.serverId)) return;
     log('INFO', who(p), `renomeou o canal "${c.name}" para "${name}"`);
     c.name = name;
     saveChannels();
-    broadcast({ type: 'channel:updated', channel: publicChannel(c) });
+    broadcastChannel(c.id, { type: 'channel:updated', channel: publicChannel(c) });
   },
 
   'channel:delete'(p, msg) {
     const c = channels.get(String(msg.id ?? ''));
-    if (!c) return;
-    if ([...channels.values()].filter((x) => x.kind === c.kind).length <= 1) {
+    if (!c || !canSee(p, c.serverId)) return;
+    if ([...channels.values()].filter((x) => x.serverId === c.serverId && x.kind === c.kind).length <= 1) {
       return send(p.ws, { type: 'notice', text: `Precisa sobrar pelo menos um canal de ${c.kind === 'voice' ? 'voz' : 'texto'}.` });
     }
     const count = deleteChannel(c);
@@ -853,9 +1058,14 @@ const handlers = {
     broadcastVoice(p.voice, { type: 'sound:play', id, by: p.name }, p.id);
   },
 
+  // Som comprido demais: qualquer um da sala de voz para para todos.
+  'sound:stop'(p) {
+    if (p.voice) broadcastVoice(p.voice, { type: 'sound:stop', by: p.name }, p.id);
+  },
+
   chat(p, msg) {
     const channel = channels.get(String(msg.channelId ?? ''));
-    if (!channel) return;
+    if (!channel || !canSee(p, channel.serverId)) return;
     const text = String(msg.text ?? '').trim().slice(0, 2000);
     const author = authorKey(p);
     const list = [];
@@ -866,22 +1076,22 @@ const handlers = {
       list.push(up.meta);
     }
     if (!text && !list.length) return;
-    addMessage({ id: newId(), channelId: channel.id, pid: p.id, author, name: p.name, color: p.color, avatar: p.avatar, text, attachments: list, ts: Date.now() });
+    addMessage({ id: newId(), channelId: channel.id, pid: p.id, author, name: p.name, color: p.color, text, attachments: list, ts: Date.now() });
   },
 
   'chat:delete'(p, msg) {
     const channelId = String(msg.channelId ?? '');
-    const list = messages.get(channelId);
+    const list = canSeeChannel(p, channelId) && messages.get(channelId);
     const i = list ? list.findIndex((m) => m.id === msg.id) : -1;
     if (i < 0) return;
-    if (list[i].author !== authorKey(p)) return send(p.ws, { type: 'notice', text: 'Só quem mandou pode apagar a mensagem.' });
+    if (!isAuthor(p, list[i])) return send(p.ws, { type: 'notice', text: 'Só quem mandou pode apagar a mensagem.' });
     deleteMessage(channelId, i);
   },
 
   // O histórico vem em páginas, das mais novas para as mais antigas.
   'chat:history'(p, msg) {
     const channelId = String(msg.channelId ?? '');
-    const list = messages.get(channelId);
+    const list = canSeeChannel(p, channelId) && messages.get(channelId);
     if (!list) return;
     let end = list.length;
     if (msg.before) {
@@ -991,9 +1201,8 @@ app.use(express.json({ limit: '512kb' }));
 
 app.get('/api/config', (req, res) => {
   res.json({
-    needsPassword: !!ROOM_PASSWORD,
+    needsCode: !!ROOM_PASSWORD,
     realtimeReady: !!(APP_ID && APP_SECRET),
-    discord: discordReady(),
     iceServers: ICE_SERVERS,
     version: APP_VERSION,
     fileMaxGB: FILE_MAX_GB,
@@ -1006,6 +1215,192 @@ app.get('/api/presence', (req, res) => {
   const list = [...participants.values()];
   res.json({ count: list.length, names: ROOM_PASSWORD ? [] : list.map((p) => p.name) });
 });
+
+// ---------- entrar, criar conta e painel de admin ----------
+
+const fail = (res, status, errorCode, errorDescription) => res.status(status).json({ errorCode, errorDescription });
+const TOO_MANY = 'Muitas tentativas erradas. Espere uns 10 minutos.';
+
+const authRoutes = express.Router();
+
+authRoutes.get('/me', (req, res) => {
+  const user = userFrom(req);
+  res.json(user && publicUser(user));
+});
+
+authRoutes.post('/register', async (req, res) => {
+  if (blocked(req)) return fail(res, 429, 'too_many', TOO_MANY);
+  const name = cleanName(req.body?.name);
+  const email = cleanEmail(req.body?.email);
+  const password = String(req.body?.password ?? '');
+  if (ROOM_PASSWORD && req.body?.code !== ROOM_PASSWORD) {
+    failed(req);
+    return fail(res, 403, 'code', 'Senha da sala incorreta. Peça para quem cuida da sala.');
+  }
+  if (!name) return fail(res, 400, 'name', 'Escolha um nome.');
+  if (!validEmail(email)) return fail(res, 400, 'email', 'Esse e-mail não parece certo.');
+  if (password.length < 6) return fail(res, 400, 'password', 'A senha precisa ter pelo menos 6 caracteres.');
+  const passHash = await hashPassword(password);
+  if (userByEmail(email)) return fail(res, 409, 'exists', 'Já existe uma conta com esse e-mail. Use "Entrar".');
+  const user = { id: newId(), email, name, passHash, createdAt: Date.now() };
+  users.set(user.id, user);
+  saveUsers();
+  startLogin(req, res, user);
+  log('INFO', null, `${name} criou uma conta (${email})`);
+  res.json(publicUser(user));
+});
+
+authRoutes.post('/login', async (req, res) => {
+  if (blocked(req)) return fail(res, 429, 'too_many', TOO_MANY);
+  const user = userByEmail(cleanEmail(req.body?.email));
+  if (!user || !(await checkPassword(req.body?.password, user.passHash))) {
+    failed(req);
+    return fail(res, 401, 'login', 'E-mail ou senha incorretos.');
+  }
+  startLogin(req, res, user);
+  res.json(publicUser(user));
+});
+
+authRoutes.post('/logout', (req, res) => {
+  logins.delete(readCookie(req, 'sala_login'));
+  saveLogins();
+  res.clearCookie('sala_login', { path: '/' });
+  res.json({ ok: true });
+});
+
+authRoutes.post('/password', async (req, res) => {
+  const user = userFrom(req);
+  if (!user) return fail(res, 401, 'unauthorized', 'Entre na sua conta de novo.');
+  if (isHost(user)) return fail(res, 400, 'admin', 'A senha do host fica no .env do servidor.');
+  if (blocked(req)) return fail(res, 429, 'too_many', TOO_MANY);
+  if (!(await checkPassword(req.body?.current, user.passHash))) {
+    failed(req);
+    return fail(res, 403, 'current', 'A senha atual não confere.');
+  }
+  const password = String(req.body?.password ?? '');
+  if (password.length < 6) return fail(res, 400, 'password', 'A senha nova precisa ter pelo menos 6 caracteres.');
+  user.passHash = await hashPassword(password);
+  saveUsers();
+  // Os outros aparelhos precisam entrar de novo com a senha nova.
+  endLogins(user.id, readCookie(req, 'sala_login'));
+  res.json({ ok: true });
+});
+
+app.use('/api/auth', authRoutes);
+
+const adminRoutes = express.Router();
+
+adminRoutes.use((req, res, next) => {
+  const user = userFrom(req);
+  if (!isAdmin(user)) return fail(res, 403, 'forbidden', 'Só o admin pode fazer isso.');
+  req.user = user;
+  next();
+});
+
+adminRoutes.get('/users', (req, res) => {
+  res.json([...users.values()].sort((a, b) => a.createdAt - b.createdAt).map(publicUser));
+});
+
+// Os admins que o host escolheu não mexem nas contas uns dos outros (nem na do host).
+function protectedAccount(req, user) {
+  if (isHost(user)) return 'A conta do host fica no .env do servidor.';
+  if (isAdmin(user) && !isHost(req.user)) return 'Só o host mexe na conta de outro admin.';
+  return null;
+}
+
+adminRoutes.post('/users/:id/password', async (req, res) => {
+  const user = users.get(req.params.id);
+  if (!user) return fail(res, 404, 'not_found', 'Essa conta não existe mais.');
+  const locked = protectedAccount(req, user);
+  if (locked) return fail(res, 403, 'admin', locked);
+  const password = String(req.body?.password ?? '');
+  if (password.length < 6) return fail(res, 400, 'password', 'A senha precisa ter pelo menos 6 caracteres.');
+  user.passHash = await hashPassword(password);
+  saveUsers();
+  endLogins(user.id);
+  kickUser(user.id, 'O admin trocou a sua senha. Entre de novo com a senha nova.');
+  log('INFO', null, `o admin trocou a senha de ${user.name} (${user.email})`);
+  res.json({ ok: true });
+});
+
+adminRoutes.delete('/users/:id', (req, res) => {
+  const user = users.get(req.params.id);
+  if (!user) return res.json({ ok: true });
+  const locked = protectedAccount(req, user);
+  if (locked) return fail(res, 403, 'admin', locked);
+  users.delete(user.id);
+  saveUsers();
+  endLogins(user.id);
+  kickUser(user.id, 'Sua conta foi apagada pelo admin.');
+  for (const s of servers.values()) if (s.members) s.members = s.members.filter((id) => id !== user.id);
+  saveServers();
+  refreshDirectories();
+  log('AVISO', null, `o admin apagou a conta de ${user.name} (${user.email})`);
+  res.json({ ok: true });
+});
+
+// Dar ou tirar o cargo de admin: só o host.
+adminRoutes.put('/users/:id/admin', (req, res) => {
+  if (!isHost(req.user)) return fail(res, 403, 'forbidden', 'Só o host dá e tira o cargo de admin.');
+  const user = users.get(req.params.id);
+  if (!user) return fail(res, 404, 'not_found', 'Essa conta não existe mais.');
+  if (isHost(user)) return fail(res, 400, 'admin', 'O host é sempre admin.');
+  user.admin = !!req.body?.admin;
+  saveUsers();
+  for (const p of participants.values()) {
+    if (p.userId !== user.id) continue;
+    p.admin = user.admin;
+    send(p.ws, { type: 'account', account: publicUser(user) });
+  }
+  // Admin enxerga todos os servidores; quem perdeu o cargo volta a ver só os seus.
+  refreshDirectories();
+  log('INFO', null, `o host ${user.admin ? 'deu' : 'tirou'} o cargo de admin ${user.admin ? 'para' : 'de'} ${user.name} (${user.email})`);
+  res.json(publicUser(user));
+});
+
+// Servidor novo já vem com um canal de texto e uma sala de voz, e só com o admin dentro.
+adminRoutes.post('/servers', (req, res) => {
+  const name = cleanName(req.body?.name);
+  if (!name) return fail(res, 400, 'name', 'Escolha um nome para o servidor.');
+  if (servers.size >= 20) return fail(res, 400, 'too_many', 'Já são 20 servidores. Apague algum antes.');
+  const s = { id: newId(), name, createdAt: Date.now(), members: [] };
+  servers.set(s.id, s);
+  addChannel(s.id, 'text', 'geral', req.user.name);
+  addChannel(s.id, 'voice', 'Geral', req.user.name);
+  saveServers();
+  saveChannels();
+  refreshDirectories();
+  log('INFO', null, `o admin criou o servidor "${name}"`);
+  res.json(publicServer(s));
+});
+
+adminRoutes.put('/servers/:id', (req, res) => {
+  const s = servers.get(req.params.id);
+  if (!s) return fail(res, 404, 'not_found', 'Esse servidor não existe mais.');
+  const name = req.body?.name !== undefined ? cleanName(req.body.name) : s.name;
+  if (!name) return fail(res, 400, 'name', 'Escolha um nome para o servidor.');
+  s.name = name;
+  // O principal é sempre aberto a todos; nos outros, só entra quem tem conta.
+  if (Array.isArray(req.body?.members) && s.members !== null) s.members = [...new Set(req.body.members.map(String))].filter((id) => users.has(id));
+  saveServers();
+  refreshDirectories();
+  res.json(publicServer(s));
+});
+
+adminRoutes.delete('/servers/:id', (req, res) => {
+  const s = servers.get(req.params.id);
+  if (!s) return res.json({ ok: true });
+  if (s.id === MAIN_SERVER) return fail(res, 400, 'main', 'O servidor principal não pode ser apagado.');
+  let count = 0;
+  for (const c of [...channels.values()]) if (c.serverId === s.id) count += deleteChannel(c);
+  servers.delete(s.id);
+  saveServers();
+  refreshDirectories();
+  log('AVISO', null, `o admin apagou o servidor "${s.name}"${count ? ` e as ${count} mensagens dele` : ''}`);
+  res.json({ ok: true });
+});
+
+app.use('/api/admin', adminRoutes);
 
 function participantFrom(value) {
   const [pid, token] = String(value || '').split(':');
@@ -1147,141 +1542,6 @@ app.post('/api/auth-cookie', requireParticipant, (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- login pelo Discord ----------
-// O servidor troca o código do Discord pelo nome e pela foto da pessoa e guarda isso num cookie
-// assinado. A conexão da sala lê o cookie, então ninguém consegue entrar com a conta de outro.
-
-function discordReady() {
-  return !!(DISCORD_ID && DISCORD_SECRET);
-}
-
-const isHttps = (req) => req.get('x-forwarded-proto') === 'https';
-
-function signDiscord(identity) {
-  const body = Buffer.from(JSON.stringify(identity)).toString('base64url');
-  return `${body}.${createHmac('sha256', DISCORD_SECRET).update(body).digest('base64url')}`;
-}
-
-function discordFrom(req) {
-  const [body, mac] = readCookie(req, 'sala_discord').split('.');
-  if (!body || !mac || !discordReady()) return null;
-  const expected = createHmac('sha256', DISCORD_SECRET).update(body).digest();
-  const given = Buffer.from(mac, 'base64url');
-  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
-  try {
-    const identity = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    return identity.exp > Date.now() ? identity : null;
-  } catch {
-    return null;
-  }
-}
-
-// Tem que estar cadastrado igualzinho em "Redirects" no portal do Discord.
-function discordRedirect(req) {
-  return `${isHttps(req) ? 'https' : 'http'}://${req.get('host')}/api/discord/callback`;
-}
-
-function discordAvatar(user) {
-  if (/^(a_)?[0-9a-f]+$/.test(user.avatar || '')) return `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=256`;
-  // Sem foto: o Discord mostra um dos bonecos padrão, escolhido pelo id (ou pela tag antiga #1234).
-  const tag = Number(user.discriminator);
-  const index = tag > 0 ? tag % 5 : Number((BigInt(user.id) >> 22n) % 6n);
-  return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
-}
-
-const DISCORD_TOKEN_EXPLAIN = {
-  invalid_client: [
-    'o Discord recusou o Client ID ou o Client Secret',
-    'confira DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET no .env (o Secret muda quando alguém clica em "Reset Secret") e rode "docker compose up -d --force-recreate"',
-  ],
-  invalid_grant: [
-    'o código do Discord expirou ou o endereço de retorno não bate',
-    'nada se for raro (é só tentar de novo). Se sempre acontecer, confira se o endereço de retorno está em OAuth2 → Redirects no portal do Discord',
-  ],
-};
-
-async function discordFetch(url, options, step) {
-  let res;
-  try {
-    res = await fetch(url, { ...options, signal: AbortSignal.timeout(10_000) });
-  } catch (err) {
-    throw Object.assign(new Error(`o servidor não conseguiu falar com o Discord ao ${step} (${err.message})`), {
-      todo: 'confira a internet do servidor (ex.: "ping 1.1.1.1"). Se estiver ok, veja discordstatus.com',
-    });
-  }
-  const data = await res.json().catch(() => ({}));
-  if (res.ok) return data;
-  const [what, todo] = DISCORD_TOKEN_EXPLAIN[data.error] || [`o Discord respondeu com um erro ao ${step}`, 'se repetir, guarde este trecho do log para análise'];
-  throw Object.assign(new Error(`${what} [${res.status} ${data.error || data.message || ''}]`), { todo });
-}
-
-async function discordUser(code, redirectUri) {
-  const token = await discordFetch(
-    `${DISCORD_API}/oauth2/token`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `Basic ${Buffer.from(`${DISCORD_ID}:${DISCORD_SECRET}`).toString('base64')}`,
-      },
-      body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri }),
-    },
-    'trocar o código pelo acesso',
-  );
-  const user = await discordFetch(`${DISCORD_API}/users/@me`, { headers: { Authorization: `Bearer ${token.access_token}` } }, 'pegar os dados da conta');
-  if (!/^\d{1,25}$/.test(user.id || '')) throw Object.assign(new Error('o Discord mandou uma conta sem id'), { todo: 'se repetir, guarde este trecho do log para análise' });
-  return user;
-}
-
-const discordRoutes = express.Router();
-
-discordRoutes.get('/login', (req, res) => {
-  if (!discordReady()) return res.redirect('/#discord=off');
-  const state = newId(16);
-  // Lax: o cookie precisa voltar junto quando o Discord manda a pessoa de volta para cá.
-  res.cookie('sala_oauth', state, { httpOnly: true, sameSite: 'lax', secure: isHttps(req), path: '/api/discord', maxAge: 10 * 60_000 });
-  const params = new URLSearchParams({ response_type: 'code', client_id: DISCORD_ID, scope: 'identify', state, redirect_uri: discordRedirect(req), prompt: 'none' });
-  res.redirect(`https://discord.com/oauth2/authorize?${params}`);
-});
-
-discordRoutes.get('/callback', async (req, res) => {
-  const state = readCookie(req, 'sala_oauth');
-  res.clearCookie('sala_oauth', { path: '/api/discord' });
-  if (req.query.error === 'access_denied') return res.redirect('/#discord=cancelado');
-  if (!discordReady() || req.query.error || !state || req.query.state !== state || typeof req.query.code !== 'string') {
-    if (req.query.error) log('AVISO', null, `o Discord não autorizou o login [${clip(req.query.error, 60)}]`, 'confira se o app do Discord está com o escopo "identify" e o endereço de retorno certo');
-    return res.redirect('/#discord=erro');
-  }
-  try {
-    const user = await discordUser(req.query.code, discordRedirect(req));
-    const identity = {
-      id: user.id,
-      name: cleanName(user.global_name || user.username) || 'Discord',
-      username: clip(user.username, 32),
-      avatar: discordAvatar(user),
-      exp: Date.now() + DISCORD_DAYS * 86_400_000,
-    };
-    res.cookie('sala_discord', signDiscord(identity), { httpOnly: true, sameSite: 'lax', secure: isHttps(req), path: '/', maxAge: DISCORD_DAYS * 86_400_000 });
-    log('INFO', null, `${identity.name} (@${identity.username}) fez login com o Discord`);
-    res.redirect('/');
-  } catch (err) {
-    log('ERRO', null, `o login com o Discord falhou: ${err.message}`, err.todo);
-    res.redirect('/#discord=erro');
-  }
-});
-
-discordRoutes.get('/me', (req, res) => {
-  const identity = discordFrom(req);
-  res.json(identity && { name: identity.name, username: identity.username, avatar: identity.avatar });
-});
-
-discordRoutes.post('/logout', (req, res) => {
-  res.clearCookie('sala_discord', { path: '/' });
-  res.json({ ok: true });
-});
-
-app.use('/api/discord', discordRoutes);
-
 const fileRoutes = express.Router();
 
 fileRoutes.post('/', requireParticipant, async (req, res) => {
@@ -1393,7 +1653,7 @@ app.use('/api/files', fileRoutes);
 
 const soundRoutes = express.Router();
 
-// O áudio vem cru no corpo; nome e emoji vão nos cabeçalhos.
+// O áudio vem cru no corpo; nome, emoji e duração (medida pelo navegador) vão nos cabeçalhos.
 soundRoutes.post('/', requireParticipant, express.raw({ type: () => true, limit: SOUND_MAX_BYTES }), async (req, res) => {
   const p = req.participant;
   const type = String(req.get('content-type') || '').split(';')[0].trim();
@@ -1406,13 +1666,17 @@ soundRoutes.post('/', requireParticipant, express.raw({ type: () => true, limit:
   };
   const name = cleanName(header('x-sound-name')).slice(0, 24);
   const emoji = [...header('x-sound-emoji').trim()].slice(0, 2).join('') || '🔊';
+  const duration = Math.round(Number(req.get('x-sound-duration')) * 10) / 10;
   if (!name || !/^(audio|video)\//.test(type) || !Buffer.isBuffer(req.body) || !req.body.length) {
     return res.status(400).json({ errorCode: 'bad_sound', errorDescription: 'Mande um arquivo de áudio e um nome para o som.' });
   }
-  if (sounds.size >= SOUNDS_MAX) {
-    return res.status(507).json({ errorCode: 'sounds_full', errorDescription: `A mesa já tem ${SOUNDS_MAX} sons. Apague algum antes.` });
+  if (!(duration > 0) || duration > SOUND_MAX_SECONDS + 0.5) {
+    return res.status(400).json({ errorCode: 'too_long', errorDescription: 'O som pode ter no máximo 3 minutos.' });
   }
-  const s = { id: newId(9), name, emoji, type, ownerId: p.id, ownerName: p.name, createdAt: Date.now() };
+  if (sounds.size >= SOUNDS_MAX) {
+    return res.status(507).json({ errorCode: 'sounds_full', errorDescription: `A mesa já tem ${SOUNDS_MAX} sons. Peça para um admin tirar algum.` });
+  }
+  const s = { id: newId(9), name, emoji, type, duration, ownerId: p.id, ownerName: p.name, createdAt: Date.now() };
   await writeFile(path.join(SOUNDS_DIR, s.id), req.body);
   sounds.set(s.id, s);
   await saveSounds();
@@ -1434,8 +1698,8 @@ soundRoutes.delete('/:id', requireParticipant, async (req, res) => {
   const p = req.participant;
   const s = sounds.get(req.params.id);
   if (!s) return res.json({ ok: true });
-  if (s.ownerId !== p.id && s.ownerName !== p.name) {
-    return res.status(403).json({ errorCode: 'forbidden', errorDescription: 'Só quem adicionou pode tirar o som.' });
+  if (!p.admin) {
+    return res.status(403).json({ errorCode: 'forbidden', errorDescription: 'Só um admin pode tirar sons da mesa.' });
   }
   sounds.delete(s.id);
   await unlink(path.join(SOUNDS_DIR, s.id)).catch(() => {});
@@ -1492,9 +1756,10 @@ attachmentRoutes.post('/', requireParticipant, express.raw({ type: () => true, l
 });
 
 attachmentRoutes.get('/:id', (req, res) => {
-  if (!cookieParticipant(req)) return res.status(401).type('text/plain; charset=utf-8').send('Entre na sala para ver este anexo.');
+  const p = cookieParticipant(req);
+  if (!p) return res.status(401).type('text/plain; charset=utf-8').send('Entre na sala para ver este anexo.');
   const a = attachments.get(req.params.id);
-  if (!a) return res.status(404).type('text/plain; charset=utf-8').send('Esse anexo foi apagado.');
+  if (!a || !canSeeChannel(p, a.channelId)) return res.status(404).type('text/plain; charset=utf-8').send('Esse anexo foi apagado.');
   const inline = INLINE_TYPES.has(a.type);
   res.sendFile(attachPath(a.id), {
     headers: {
@@ -1538,7 +1803,7 @@ wss.on('connection', (ws, req) => {
   ws.tokens = 60;
   ws.lastRefill = Date.now();
   ws.device = shortDevice(req.headers['user-agent']);
-  ws.discord = discordFrom(req);
+  ws.userId = userFrom(req)?.id;
   ws.on('pong', () => {
     ws.isAlive = true;
   });
@@ -1566,6 +1831,8 @@ wss.on('connection', (ws, req) => {
 await loadUsage();
 await loadFiles();
 await loadSounds();
+await loadUsers();
+await loadServers();
 await loadChannels();
 
 setInterval(saveUsage, 30_000);
@@ -1598,5 +1865,8 @@ server.listen(PORT, () => {
   if (!APP_ID || !APP_SECRET) {
     log('AVISO', null, 'sem as chaves do Cloudflare Realtime: voz, câmera e telas estão desligados', 'preencha REALTIME_APP_ID e REALTIME_APP_SECRET no .env e rode "docker compose up -d --force-recreate"');
   }
-  if (!ROOM_PASSWORD) log('AVISO', null, 'a sala está sem senha: qualquer pessoa com o link entra', 'se quiser, preencha ROOM_PASSWORD no .env');
+  if (!ROOM_PASSWORD) log('AVISO', null, 'a sala está sem senha: qualquer pessoa com o link cria uma conta e entra', 'se quiser, preencha ROOM_PASSWORD no .env (ela é pedida para criar conta)');
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+    log('AVISO', null, 'não há conta de admin: ninguém consegue criar servidores nem trocar senhas', 'preencha ADMIN_EMAIL e ADMIN_PASSWORD no .env e rode "docker compose up -d --force-recreate"');
+  }
 });
