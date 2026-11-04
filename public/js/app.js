@@ -122,18 +122,31 @@ async function init() {
   $('#join-mic').checked = state.micOn;
   $('#join-cam').checked = store.get('joinCam', false);
   $('#join-form').addEventListener('submit', onJoinSubmit);
-  for (const tab of $$('.auth-tab')) tab.addEventListener('click', () => setAuthMode(tab.dataset.mode));
+  bindAuthUi();
   bindRoomUi();
 
   try {
     state.config = await fetch('/api/config').then((r) => r.json());
   } catch {
-    state.config = { needsCode: false, realtimeReady: false, iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] };
+    state.config = { realtimeReady: false, iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] };
   }
   $('#join-warning').hidden = state.config.realtimeReady;
   setAuthMode(store.get('email', '') ? 'login' : 'register');
   refreshPresence();
   presenceTimer = setInterval(refreshPresence, 10000);
+  // Link de convite (#convite=CODIGO): guarda o código para entrar no servidor depois do login.
+  const invite = /^#convite=([\w-]+)$/.exec(location.hash);
+  if (invite) {
+    history.replaceState(null, '', location.pathname + location.search);
+    store.set('invite', invite[1]);
+  }
+  showInvite();
+  // Links dos e-mails: #confirmar=TOKEN (ativa a conta e já entra) e #senha=TOKEN (escolher senha nova).
+  const link = /^#(confirmar|senha)=([\w-]+)$/.exec(location.hash);
+  if (link) {
+    history.replaceState(null, '', location.pathname + location.search);
+    return openEmailLink(link[1], link[2]);
+  }
   // Já entrou neste aparelho antes: vai direto para a sala.
   state.account = await fetch('/api/auth/me').then((r) => r.json()).catch(() => null);
   if (state.account) return enterWithAccount();
@@ -142,45 +155,132 @@ async function init() {
 
 // ---------- conta ----------
 
-let authMode = 'login';
+const AUTH_MODES = {
+  login: { title: 'Entrar', sub: 'Que bom te ver de novo.', button: 'Entrar', busy: 'Entrando…', ask: 'Ainda não tem conta?', to: 'register', link: 'Criar conta' },
+  register: { title: 'Criar conta', sub: 'Leva um minuto. Depois é só confirmar o e-mail.', button: 'Criar conta', busy: 'Criando a conta…', ask: 'Já tem conta?', to: 'login', link: 'Entrar' },
+  forgot: { title: 'Esqueci minha senha', sub: 'Mandamos um link para você escolher uma senha nova.', button: 'Mandar o link', busy: 'Mandando…', ask: 'Lembrou?', to: 'login', link: 'Voltar para entrar' },
+  reset: { title: 'Senha nova', sub: 'Escolha a senha nova da sua conta.', button: 'Salvar e entrar', busy: 'Salvando…', ask: '', to: 'login', link: 'Voltar para entrar' },
+  sent: { title: 'Veja seu e-mail', sub: '', button: '', busy: '', ask: '', to: 'login', link: 'Voltar para entrar' },
+};
 
-function setAuthMode(mode) {
+let authMode = 'login';
+let resetToken = null; // do link de "Esqueci minha senha"
+let pendingEmail = null; // cadastro esperando a confirmação, para "Mandar o e-mail de novo"
+
+function setAuthMode(mode, sentText) {
   authMode = mode;
-  const register = mode === 'register';
-  for (const b of $$('.auth-tab')) b.setAttribute('aria-selected', String(b.dataset.mode === mode));
-  $('#field-name').hidden = !register;
-  $('#join-name').required = register;
-  $('#field-code').hidden = !register || !state.config?.needsCode;
-  $('#join-code').required = !$('#field-code').hidden;
-  $('#join-pass').autocomplete = register ? 'new-password' : 'current-password';
-  $('#join-pass').minLength = register ? 6 : 0;
+  const m = AUTH_MODES[mode];
+  $('#join-title').textContent = m.title;
+  $('#join-sub').textContent = m.sub;
+  $('#join-sub').hidden = !m.sub;
+  $('#field-name').hidden = mode !== 'register';
+  $('#field-email').hidden = !['login', 'register', 'forgot'].includes(mode);
+  $('#field-pass').hidden = !['login', 'register', 'reset'].includes(mode);
+  $('#forgot-link').hidden = mode !== 'login';
+  $('#join-prefs').hidden = mode !== 'login' && mode !== 'register';
+  $('#join-sent').hidden = mode !== 'sent';
+  $('#join-btn').hidden = mode === 'sent';
+  $('#join-name').required = mode === 'register';
+  $('#join-email').required = !$('#field-email').hidden;
+  $('#join-pass').required = !$('#field-pass').hidden;
+  $('#join-pass-label').textContent = mode === 'reset' ? 'Senha nova' : 'Senha';
+  $('#join-pass').autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+  $('#join-pass').minLength = mode === 'login' ? 0 : 6;
+  if (sentText) $('#join-sent-text').textContent = sentText;
+  $('#resend-btn').hidden = !pendingEmail;
+  $('#join-switch-text').textContent = m.ask;
+  $('#switch-btn').textContent = m.link;
+  $('#switch-btn').dataset.mode = m.to;
   showJoinError('');
   setJoinBusy(false);
 }
 
+async function authApi(action, body) {
+  let res;
+  try {
+    res = await fetch(`/api/auth/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  } catch {
+    throw new Error('Sem conexão com o servidor.');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.errorDescription || `Erro ${res.status}`);
+  return data;
+}
+
+function bindAuthUi() {
+  $('#switch-btn').addEventListener('click', (e) => setAuthMode(e.currentTarget.dataset.mode));
+  $('#forgot-link').addEventListener('click', () => setAuthMode('forgot'));
+  $('#pass-toggle').addEventListener('click', () => {
+    const show = $('#join-pass').type === 'password';
+    $('#join-pass').type = show ? 'text' : 'password';
+    $('#pass-toggle').classList.toggle('on', show);
+    $('#pass-toggle').setAttribute('aria-label', show ? 'Esconder a senha' : 'Mostrar a senha');
+  });
+  $('#resend-btn').addEventListener('click', async () => {
+    if (!pendingEmail) return;
+    $('#resend-btn').disabled = true;
+    await authApi('resend', { email: pendingEmail }).catch(() => {});
+    $('#join-sent-text').textContent = `Mandamos de novo para ${pendingEmail}. Veja também a caixa de spam.`;
+    setTimeout(() => ($('#resend-btn').disabled = false), 30_000);
+  });
+}
+
 async function onJoinSubmit(event) {
   event.preventDefault();
+  if (authMode === 'sent') return;
   state.micOn = $('#join-mic').checked;
   store.set('joinMic', state.micOn);
   store.set('joinCam', $('#join-cam').checked);
   const email = $('#join-email').value.trim();
-  const body = { email, password: $('#join-pass').value };
-  if (authMode === 'register') Object.assign(body, { name: $('#join-name').value.trim(), code: $('#join-code').value });
+  const password = $('#join-pass').value;
+  const body = {
+    login: { email, password },
+    register: { email, password, name: $('#join-name').value.trim() },
+    forgot: { email },
+    reset: { token: resetToken, password },
+  }[authMode];
   setJoinBusy(true);
   showJoinError('');
+  let data;
   try {
-    const res = await fetch(`/api/auth/${authMode}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.errorDescription || `Erro ${res.status}`);
-    state.account = data;
+    data = await authApi(authMode, body);
   } catch (err) {
     setJoinBusy(false);
-    return showJoinError(err instanceof TypeError ? 'Sem conexão com o servidor.' : err.message);
+    return showJoinError(err.message);
   }
-  store.set('email', email);
+  if (email) store.set('email', email);
+  if (authMode === 'register') {
+    pendingEmail = email;
+    return setAuthMode('sent', `Mandamos um link para ${email}. Abra o e-mail e clique nele para ativar a conta (veja também o spam). O link vale por 24 horas.`);
+  }
+  if (authMode === 'forgot') {
+    pendingEmail = null;
+    return setAuthMode('sent', `Se existir uma conta com ${email}, chegou um link para trocar a senha. Ele vale por 1 hora (veja também o spam).`);
+  }
+  // Entrou (com a senha ou com a senha nova): segue para a sala.
+  state.account = data;
+  resetToken = null;
   $('#join-pass').value = '';
-  $('#join-code').value = '';
   unlockAudio();
+  enterWithAccount();
+}
+
+async function openEmailLink(kind, token) {
+  if (kind === 'senha') {
+    resetToken = token;
+    setAuthMode('reset');
+    return $('#join-pass').focus();
+  }
+  setAuthMode('login');
+  setJoinBusy(true);
+  try {
+    state.account = await authApi('verify', { token });
+  } catch (err) {
+    setJoinBusy(false);
+    return showJoinError(err.message);
+  }
+  store.set('email', state.account.email);
+  toast(state.account.host ? 'E-mail confirmado. Você é o host da sala!' : 'E-mail confirmado. Bem-vindo à sala!');
   enterWithAccount();
 }
 
@@ -195,13 +295,28 @@ async function logout() {
   leave();
 }
 
+// Quem chegou por um link de convite vê para qual servidor foi chamado.
+async function showInvite() {
+  const code = store.get('invite', null);
+  $('#join-invite').hidden = true;
+  if (!code) return;
+  try {
+    const res = await fetch(`/api/invite/${encodeURIComponent(code)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.errorDescription);
+    $('#join-invite-text').textContent = `Você foi convidado para ${data.name}. Entre ou crie sua conta para participar.`;
+  } catch (err) {
+    $('#join-invite-text').textContent = err.message || 'Não deu para abrir o convite agora.';
+  }
+  $('#join-invite').hidden = false;
+}
+
 async function refreshPresence() {
   if (state.inRoom) return;
   try {
     const p = await fetch('/api/presence').then((r) => r.json());
     let text = 'Ninguém na sala agora';
-    if (p.count && p.names?.length) text = `${listNames(p.names)} ${p.count === 1 ? 'está' : 'estão'} na sala`;
-    else if (p.count) text = `${p.count} ${p.count === 1 ? 'pessoa' : 'pessoas'} na sala`;
+    if (p.count) text = `${p.count} ${p.count === 1 ? 'pessoa' : 'pessoas'} online agora`;
     $('#presence').textContent = text;
     $('.presence').classList.toggle('empty', !p.count);
   } catch {
@@ -209,14 +324,11 @@ async function refreshPresence() {
   }
 }
 
-function listNames(names) {
-  if (names.length <= 3) return names.join(', ').replace(/, ([^,]*)$/, ' e $1');
-  return `${names.slice(0, 3).join(', ')} e mais ${names.length - 3}`;
-}
 
 function setJoinBusy(busy) {
   $('#join-btn').disabled = busy;
-  $('#join-btn').textContent = busy ? 'Entrando…' : authMode === 'register' ? 'Criar conta e entrar' : 'Entrar';
+  const m = AUTH_MODES[authMode];
+  $('#join-btn').textContent = busy ? m.busy || 'Entrando…' : m.button;
 }
 
 function showJoinError(text) {
@@ -296,7 +408,14 @@ function onMessage(msg) {
     case 'directory':
       return onDirectory(msg);
     case 'account':
-      return onAccount(msg.account);
+      return onAccount(msg.account, msg.by);
+    case 'server:joined':
+      return onServerJoined(msg);
+    case 'invite:error':
+      store.set('invite', null);
+      $('#no-servers-error').textContent = msg.text;
+      if (state.servers.size) toast(msg.text);
+      return;
     case 'pong':
       return onPong(msg);
     case 'notice':
@@ -403,8 +522,12 @@ function onWelcome(msg) {
   }
   state.participants = new Map(msg.state.participants.map((p) => [p.id, p]));
   state.streams = new Map(msg.state.streams.map((s) => [s.id, s]));
-  state.account = { id: msg.you.userId, email: msg.you.email, name: msg.you.name, admin: msg.you.admin, host: msg.you.host };
+  state.account = accountOf({ ...msg.you, id: msg.you.userId });
   state.servers = new Map(msg.state.servers.map((s) => [s.id, s]));
+  if (state.account.muted) state.micOn = false;
+  // Chegou por um link de convite: entra no servidor agora que já está logado.
+  const invite = store.get('invite', null);
+  if (invite) send({ type: 'server:join', code: invite });
   state.channels = new Map(msg.state.channels.map((c) => [c.id, c]));
   state.musics = new Map(Object.entries(msg.state.musics));
   state.files = new Map(msg.state.files.map((f) => [f.id, f]));
@@ -679,7 +802,7 @@ function cameraConstraints() {
 }
 
 async function startMic() {
-  if (local.mic || micStarting || !state.config.realtimeReady || !state.voice) return;
+  if (local.mic || micStarting || !state.config.realtimeReady || !state.voice || state.account?.muted) return;
   micStarting = true;
   const voice = state.voice;
   let entry = null;
@@ -711,6 +834,7 @@ async function startMic() {
 }
 
 function toggleMic() {
+  if (state.account?.muted) return toast('Um admin te mutou. Só um admin pode desmutar.');
   if (state.deafened) {
     state.deafened = false;
     state.micOn = true;
@@ -729,7 +853,7 @@ function toggleDeafen() {
     state.micBeforeDeafen = state.micOn;
     state.micOn = false;
   } else {
-    state.micOn = state.micBeforeDeafen;
+    state.micOn = state.micBeforeDeafen && !state.account?.muted;
   }
   applyDeafen();
   applyMic();
@@ -1297,6 +1421,7 @@ function paintAvatar(el, { name, color }) {
 
 function renderAll() {
   if (!state.inRoom) return;
+  renderNoServers();
   renderControls();
   renderPeople();
   renderView();
@@ -1313,7 +1438,8 @@ function renderControls() {
   mic.innerHTML = icon(state.micOn ? 'mic' : 'mic-off');
   mic.classList.toggle('off', !state.micOn);
   mic.disabled = micStarting;
-  mic.title = mic.ariaLabel = state.micOn ? 'Desligar o microfone' : 'Ligar o microfone';
+  mic.classList.toggle('locked', !!state.account?.muted);
+  mic.title = mic.ariaLabel = state.account?.muted ? 'Um admin te mutou' : state.micOn ? 'Desligar o microfone' : 'Ligar o microfone';
 
   const deafen = $('#btn-deafen');
   deafen.innerHTML = icon(state.deafened ? 'headphones-off' : 'headphones');
@@ -1335,10 +1461,40 @@ function renderControls() {
   screen.title = screen.ariaLabel = local.screens.size ? 'Compartilhar mais uma tela ou janela' : 'Compartilhar tela ou janela';
 }
 
+// Quem aparece em Pessoas: os membros do servidor aberto (o host está em todos).
+function serverPeople(server = currentServer()) {
+  if (!server) return [];
+  return sortedParticipants().filter((p) => p.id === state.me?.id || p.host || server.members.includes(p.userId));
+}
+
+// Admin mexe em quem não é admin; o host, em todos (menos nele mesmo). O servidor confere de novo.
+function canManage(p) {
+  const me = state.account;
+  if (!me?.admin || !p || p.userId === me.id || p.host) return false;
+  return !p.admin || !!me.host;
+}
+
+function personActions(p) {
+  if (!canManage(p)) return '';
+  const server = currentServer();
+  const inThisServer = p.voice && state.channels.get(p.voice)?.serverId === server?.id;
+  const btn = (act, iconName, text, cls = '') => `<button class="person-act ${cls}" type="button" data-act="${act}">${icon(iconName)}<span>${text}</span></button>`;
+  return [
+    btn('mute', p.muted ? 'mic' : 'mic-off', p.muted ? 'Desmutar' : 'Mutar'),
+    inThisServer && btn('voice-kick', 'leave', 'Tirar da sala de voz'),
+    state.account.host && btn('role', 'shield', p.admin ? 'Tirar o cargo de admin' : 'Tornar admin'),
+    server?.members.includes(p.userId) && btn('kick', 'user-x', `Expulsar de ${server.name}`, 'danger'),
+    btn('ban', 'ban', `Banir de ${server?.name || 'servidor'}`, 'danger'),
+  ]
+    .filter(Boolean)
+    .join('');
+}
+
 function renderPeople() {
   if (!state.inRoom) return;
-  $('#people-count').textContent = state.participants.size;
-  const items = sortedParticipants().map((p) => {
+  const people = serverPeople();
+  $('#people-count').textContent = people.length;
+  const items = people.map((p) => {
     const mine = p.id === state.me.id;
     const hasCam = mine ? !!local.camera : !!cameraOf(p.id);
     const screens = screenCountOf(p.id);
@@ -1356,29 +1512,39 @@ function renderPeople() {
       const doing = [hasCam && 'câmera ligada', screens && `${screens} ${screens > 1 ? 'telas' : 'tela'} ao vivo`].filter(Boolean).join(' · ');
       status = `Em ${where.name} · ${doing || (p.deafened ? 'sem ouvir' : p.micOn ? 'na call' : 'mutado')}`;
     }
+    if (p.muted) status += ' · mutado por um admin';
     const icons = where
       ? [!p.micOn && icon('mic-off', 'bad'), p.deafened && icon('headphones-off', 'bad'), hasCam && icon('video'), screens && icon('monitor')]
           .filter(Boolean)
           .join('')
       : '';
+    const tag = p.host ? '<span class="admin-tag">host</span>' : p.admin ? '<span class="admin-tag">admin</span>' : '';
 
     li.innerHTML = `
       <div class="person-row">
         <div class="avatar sm"></div>
         <div class="person-main"><div class="person-name"></div><div class="person-status"></div></div>
+        ${tag}
         <div class="person-icons">${icons}</div>
       </div>`;
     paintAvatar($('.avatar', li), p);
     $('.person-name', li).textContent = mine ? `${p.name} (você)` : p.name;
     $('.person-status', li).textContent = status;
     if (!mine) {
-      li.title = 'Clique para ajustar o volume';
+      li.title = canManage(p) ? 'Clique para ver as opções' : 'Clique para ajustar o volume';
       if (state.expanded === p.id) {
         const vol = document.createElement('label');
         vol.className = 'person-vol';
-        vol.innerHTML = `${icon('volume')}<input type="range" min="0" max="100" aria-label="Volume">`;
+        vol.innerHTML = `${icon('volume')}<input type="range" min="0" max="100" aria-label="Volume (só para você)">`;
         $('input', vol).value = Math.round(volumeFor(p.id) * 100);
         li.append(vol);
+        const actions = personActions(p);
+        if (actions) {
+          const box = document.createElement('div');
+          box.className = 'person-actions';
+          box.innerHTML = actions;
+          li.append(box);
+        }
       }
     }
     return li;
@@ -1386,8 +1552,34 @@ function renderPeople() {
   $('#people').replaceChildren(...items);
 }
 
+function onPersonAction(act, p) {
+  const server = currentServer();
+  if (act === 'mute') return send({ type: 'member:mute', userId: p.userId, muted: !p.muted });
+  if (act === 'voice-kick') return send({ type: 'voice:kick', pid: p.id });
+  if (act === 'role') {
+    const ask = p.admin
+      ? `Tirar o cargo de admin de ${p.name}?`
+      : `Tornar ${p.name} admin? A pessoa vai poder mutar, expulsar e banir quem não é admin, trocar senhas, apagar contas, tirar sons da mesa e arrastar canais e pessoas.`;
+    if (!confirm(ask)) return;
+    return adminApi('PUT', `/users/${p.userId}/admin`, { admin: !p.admin }).catch((err) => toast(err.message));
+  }
+  if (!server) return;
+  if (act === 'kick' && confirm(`Expulsar ${p.name} de ${server.name}? A pessoa pode voltar se tiver o link de convite.`)) {
+    send({ type: 'member:kick', userId: p.userId, serverId: server.id });
+  }
+  if (act === 'ban' && confirm(`Banir ${p.name} de ${server.name}? A pessoa sai e não consegue voltar nem com o convite (só o host desfaz).`)) {
+    send({ type: 'member:kick', userId: p.userId, serverId: server.id, ban: true });
+  }
+}
+
 function onPeopleClick(event) {
   if (event.target.closest('.person-vol')) return;
+  const act = event.target.closest('[data-act]');
+  if (act) {
+    const p = state.participants.get(act.closest('.person')?.dataset.id);
+    if (p) onPersonAction(act.dataset.act, p);
+    return;
+  }
   const li = event.target.closest('.person');
   if (!li || li.dataset.id === state.me.id) return;
   state.expanded = state.expanded === li.dataset.id ? null : li.dataset.id;
@@ -1680,7 +1872,63 @@ const INLINE_IMAGE = /^image\/(png|jpeg|gif|webp|avif)$/;
 // ---------- servidores ----------
 
 function sortedServers() {
-  return [...state.servers.values()].sort((a, b) => Number(b.open) - Number(a.open) || a.createdAt - b.createdAt);
+  return [...state.servers.values()].sort((a, b) => a.createdAt - b.createdAt);
+}
+
+const inviteLink = (s) => `${location.origin}/convite/${s.invite}`;
+
+// Aceita o código sozinho ou o link inteiro.
+const parseInvite = (text) => /convite[=/]([\w-]{4,32})/.exec(text)?.[1] || text.trim();
+
+function joinByInvite(text) {
+  const code = parseInvite(String(text || ''));
+  if (!code) return;
+  $('#no-servers-error').textContent = '';
+  send({ type: 'server:join', code });
+}
+
+function onServerJoined({ id, name, already }) {
+  store.set('invite', null);
+  $('#no-servers-code').value = '';
+  toast(already ? `Você já está em ${name}.` : `Você entrou em ${name}!`);
+  // A lista nova de servidores pode chegar logo depois deste aviso.
+  const open = () => {
+    if (!state.servers.has(id)) return false;
+    state.view = null;
+    selectServer(id);
+    return true;
+  };
+  if (!open()) setTimeout(open, 300);
+}
+
+async function copyInvite(s) {
+  if (!s?.invite) return;
+  const link = inviteLink(s);
+  try {
+    await navigator.clipboard.writeText(link);
+  } catch {
+    // Navegador sem acesso à área de transferência: copia pelo jeito antigo.
+    const area = Object.assign(document.createElement('textarea'), { value: link });
+    document.body.append(area);
+    area.select();
+    const copied = document.execCommand('copy');
+    area.remove();
+    if (!copied) {
+      try {
+        prompt(`Link de convite de ${s.name}:`, link);
+      } catch {
+        toast(`Convite de ${s.name}: ${link}`, { timeout: 20000 });
+      }
+      return;
+    }
+  }
+  toast(`Link de convite de ${s.name} copiado.`);
+}
+
+// Sem servidor nenhum: a tela de "que pena" cobre a sala até chegar um convite.
+function renderNoServers() {
+  const none = state.inRoom && !state.servers.size;
+  $('#no-servers').hidden = !none;
 }
 
 function currentServer() {
@@ -1712,18 +1960,22 @@ function renderServerMenu() {
     $('.server-item-name', b).textContent = s.name;
     return b;
   });
-  if (state.account?.admin) {
+  const extra = (act, iconName, text) => {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'server-item muted';
-    b.dataset.adminPanel = '1';
-    b.innerHTML = `${icon('plus')}<span class="server-item-name">Criar servidor ou mudar membros</span>`;
+    b.dataset.menu = act;
+    b.innerHTML = `${icon(iconName)}<span class="server-item-name"></span>`;
+    $('.server-item-name', b).textContent = text;
     items.push(b);
-  }
+  };
+  if (current?.invite) extra('invite', 'link', `Copiar convite de ${current.name}`);
+  extra('join', 'plus', 'Entrar com um convite');
+  if (state.account?.host) extra('servers', 'settings', 'Gerenciar servidores');
   $('#server-menu').replaceChildren(...items);
 }
 
-// O admin mexeu em servidores ou membros: chega a lista nova do que esta conta enxerga.
+// Mexeram em servidores ou membros: chega a lista nova do que esta conta enxerga.
 function onDirectory(d) {
   state.servers = new Map(d.servers.map((s) => [s.id, s]));
   state.channels = new Map(d.channels.map((c) => [c.id, c]));
@@ -1733,15 +1985,33 @@ function onDirectory(d) {
   if (state.voice && !state.channels.has(state.voice)) leaveVoice({ notify: false });
   syncMusic();
   renderAll();
-  renderAdmin();
+  renderServersPanel();
 }
 
-// O host deu ou tirou o cargo de admin desta conta.
-function onAccount(account) {
-  const was = state.account?.admin;
-  state.account = { id: account.id, email: account.email, name: account.name, admin: account.admin, host: account.host };
-  if (was !== account.admin) toast(account.admin ? 'Você agora é admin da sala.' : 'Você não é mais admin da sala.');
+const accountOf = (a) => ({ id: a.id, email: a.email, name: a.name, admin: a.admin, host: a.host, muted: !!a.muted });
+
+// O host deu ou tirou o cargo de admin desta conta, ou um admin mutou ou desmutou.
+function onAccount(account, by) {
+  const was = state.account;
+  state.account = accountOf(account);
+  if (was?.admin !== account.admin) toast(account.admin ? 'Você agora é admin da sala.' : 'Você não é mais admin da sala.');
   if (!account.admin && $('#admin-dialog').open) $('#admin-dialog').close();
+  if (!!was?.muted !== !!account.muted) {
+    if (account.muted) {
+      // O servidor já parou de mandar o microfone para os outros; aqui ele desliga de vez.
+      state.micOn = false;
+      const mic = local.mic;
+      if (mic) {
+        local.mic = null;
+        unpublishLocal(mic);
+        detachMeter(state.me.id);
+      }
+      sendState();
+      toast(`${by || 'Um admin'} te mutou. Só um admin pode desmutar.`, { timeout: 8000 });
+    } else {
+      toast(`${by || 'Um admin'} te desmutou. Pode ligar o microfone.`);
+    }
+  }
   renderAll();
   renderSoundpad();
 }
@@ -1865,8 +2135,6 @@ function renderChannels() {
   });
   $('#channel-list').replaceChildren(...groups);
   $('#server-name').textContent = currentServer()?.name || '';
-  // Só vale a pena abrir a lista quando há mais de um servidor ou quando é o admin.
-  $('#server-head').disabled = state.servers.size < 2 && !state.account?.admin;
   const voice = state.channels.get(state.voice);
   $('#voice-status').hidden = !voice;
   if (voice) {
@@ -2380,7 +2648,16 @@ function bindChannels() {
     const add = e.target.closest('[data-add]');
     if (add) return openChannelDialog({ kind: add.dataset.add });
     const edit = e.target.closest('[data-edit]');
-    if (edit) openChannelDialog({ channel: state.channels.get(edit.dataset.edit) });
+    if (edit) return openChannelDialog({ channel: state.channels.get(edit.dataset.edit) });
+    // Clicar em quem está numa sala de voz abre as opções da pessoa em Pessoas.
+    const member = e.target.closest('[data-member]');
+    if (member && member.dataset.member !== state.me?.id) {
+      $('#room').classList.remove('side-hidden', 'channels-open');
+      setTab('people');
+      state.expanded = member.dataset.member;
+      renderPeople();
+      $(`#people .person[data-id="${member.dataset.member}"]`)?.scrollIntoView({ block: 'nearest' });
+    }
   });
   bindChannelDrag();
   $('#channel-form').addEventListener('submit', (e) => {
@@ -2407,11 +2684,21 @@ function bindChannels() {
   $('#server-menu').addEventListener('click', (e) => {
     const item = e.target.closest('[data-server]');
     if (item) return selectServer(item.dataset.server);
-    if (e.target.closest('[data-admin-panel]')) {
-      toggleServerMenu(false);
-      openAdmin();
+    const act = e.target.closest('[data-menu]')?.dataset.menu;
+    if (!act) return;
+    toggleServerMenu(false);
+    if (act === 'invite') copyInvite(currentServer());
+    else if (act === 'servers') openServersPanel();
+    else if (act === 'join') {
+      const code = prompt('Cole o link ou o código de convite:');
+      if (code) joinByInvite(code);
     }
   });
+  $('#no-servers-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    joinByInvite($('#no-servers-code').value);
+  });
+  $('#no-servers-logout').addEventListener('click', logout);
   document.addEventListener('click', (e) => {
     if (!$('#server-menu').hidden && !e.target.closest('#server-menu, #server-head')) toggleServerMenu(false);
   });
@@ -2439,7 +2726,6 @@ function bindChannels() {
 // ---------- painel de admin ----------
 
 let adminUsers = [];
-let adminExpanded = null; // servidor com a lista de membros aberta
 
 async function adminApi(method, path, body) {
   let res;
@@ -2475,24 +2761,79 @@ async function openAdmin() {
   renderAdmin();
 }
 
-function renderAdmin() {
-  if (!$('#admin-dialog').open) return;
-  $('#admin-servers').replaceChildren(
+// ---------- painel de servidores (só o host) ----------
+
+async function serversApi(method, path, body) {
+  let res;
+  try {
+    res = await fetch(`/api/servers${path}`, {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new Error('Sem conexão com o servidor.');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.errorDescription || `Erro ${res.status}`);
+  return data;
+}
+
+async function serversAction(task) {
+  $('#servers-error').textContent = '';
+  try {
+    await task();
+  } catch (err) {
+    $('#servers-error').textContent = err.message;
+  }
+}
+
+async function openServersPanel() {
+  if (!state.account?.host) return;
+  $('#servers-dialog').showModal();
+  renderServersPanel();
+  await serversAction(async () => {
+    adminUsers = await adminApi('GET', '/users');
+  });
+  renderServersPanel();
+}
+
+function renderServersPanel() {
+  if (!$('#servers-dialog').open) return;
+  const nameOf = (id) => adminUsers.find((u) => u.id === id);
+  $('#servers-list').replaceChildren(
     ...sortedServers().map((s) => {
       const li = document.createElement('li');
       li.className = 'admin-item';
       li.dataset.server = s.id;
-      const extra = s.open
-        ? ''
-        : `<button class="btn secondary small" type="button" data-act="members">Membros</button><button class="icon-btn sm" type="button" data-act="delete" aria-label="Apagar servidor" title="Apagar servidor">${icon('trash')}</button>`;
-      li.innerHTML = `<div class="admin-row"><div class="admin-main"><div class="admin-name"></div><div class="admin-sub"></div></div><button class="btn secondary small" type="button" data-act="rename">Renomear</button>${extra}</div>`;
+      const banned = s.banned || [];
+      li.innerHTML = `
+        <div class="admin-row">
+          <div class="admin-main"><div class="admin-name"></div><div class="admin-sub"></div></div>
+          <button class="btn secondary small" type="button" data-act="members">Membros</button>
+          <button class="icon-btn sm" type="button" data-act="rename" aria-label="Renomear" title="Renomear">${icon('settings')}</button>
+          <button class="icon-btn sm" type="button" data-act="delete" aria-label="Apagar servidor" title="Apagar servidor">${icon('trash')}</button>
+        </div>
+        <div class="invite-row">
+          <input class="input invite-input" readonly aria-label="Link de convite">
+          <button class="btn small" type="button" data-act="copy">${icon('link')}Copiar</button>
+          <button class="btn secondary small" type="button" data-act="new-invite" title="O link antigo para de funcionar">Novo link</button>
+        </div>`;
       $('.admin-name', li).textContent = s.name;
-      $('.admin-sub', li).textContent = s.open ? 'Aberto a todas as contas' : `${s.members.length} ${s.members.length === 1 ? 'membro' : 'membros'} além de você`;
-      if (adminExpanded === s.id && !s.open) {
+      const count = s.members.length;
+      $('.admin-sub', li).textContent = `${count} ${count === 1 ? 'membro' : 'membros'}${banned.length ? ` · ${banned.length} ${banned.length === 1 ? 'banido' : 'banidos'}` : ''}`;
+      $('.invite-input', li).value = inviteLink(s);
+      if (serversExpanded === s.id) {
         const box = document.createElement('div');
         box.className = 'admin-members';
-        for (const u of adminUsers) {
-          if (u.admin) continue;
+        const others = adminUsers.filter((u) => !u.host && !banned.includes(u.id));
+        if (others.length) {
+          const head = document.createElement('p');
+          head.className = 'hint';
+          head.textContent = 'Ligue para colocar a pessoa no servidor; desligue para tirar.';
+          box.append(head);
+        }
+        for (const u of others) {
           const label = document.createElement('label');
           label.className = 'toggle-row';
           label.innerHTML = '<span class="toggle-text"></span><input type="checkbox" class="switch">';
@@ -2501,12 +2842,75 @@ function renderAdmin() {
           $('input', label).dataset.user = u.id;
           box.append(label);
         }
-        if (!box.children.length) box.textContent = 'Ninguém além de você tem conta ainda.';
+        if (!others.length && !banned.length) box.append('Ninguém além de você tem conta ainda.');
+        for (const id of banned) {
+          const row = document.createElement('div');
+          row.className = 'admin-row banned-row';
+          row.innerHTML = `<div class="admin-main"><div class="admin-name"></div><div class="admin-sub">Banido</div></div><button class="btn secondary small" type="button" data-act="unban">Desbanir</button>`;
+          row.dataset.user = id;
+          const u = nameOf(id);
+          $('.admin-name', row).textContent = u ? `${u.name} · ${u.email}` : 'Conta';
+          box.append(row);
+        }
         li.append(box);
       }
       return li;
     }),
   );
+}
+
+let serversExpanded = null; // servidor com a lista de membros aberta no painel do host
+
+function bindServersPanel() {
+  $('#servers-close').addEventListener('click', () => $('#servers-dialog').close());
+  $('#btn-servers').addEventListener('click', () => {
+    $('#settings').close();
+    openServersPanel();
+  });
+  $('#server-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = $('#server-new').value.trim();
+    if (!name) return;
+    serversAction(async () => {
+      const s = await serversApi('POST', '/', { name });
+      $('#server-new').value = '';
+      serversExpanded = s.id;
+      renderServersPanel();
+    });
+  });
+  $('#servers-list').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-act]');
+    const s = state.servers.get(e.target.closest('[data-server]')?.dataset.server);
+    if (!b || !s) return;
+    const act = b.dataset.act;
+    if (act === 'copy') copyInvite(s);
+    else if (act === 'new-invite' && confirm(`Criar um link novo para ${s.name}? O link antigo para de funcionar (quem já entrou continua).`)) {
+      serversAction(() => serversApi('POST', `/${s.id}/invite`));
+    } else if (act === 'rename') {
+      const name = prompt('Nome novo do servidor:', s.name)?.trim();
+      if (name && name !== s.name) serversAction(() => serversApi('PUT', `/${s.id}`, { name }));
+    } else if (act === 'members') {
+      serversExpanded = serversExpanded === s.id ? null : s.id;
+      renderServersPanel();
+    } else if (act === 'unban') {
+      serversAction(() => serversApi('DELETE', `/${s.id}/banned/${b.closest('[data-user]').dataset.user}`));
+    } else if (act === 'delete' && confirm(`Apagar o servidor ${s.name}, com todos os canais, mensagens e imagens dele? Não dá para desfazer.`)) {
+      serversAction(() => serversApi('DELETE', `/${s.id}`));
+    }
+  });
+  $('#servers-list').addEventListener('change', (e) => {
+    const box = e.target.closest('input[data-user]');
+    const s = state.servers.get(e.target.closest('[data-server]')?.dataset.server);
+    if (!box || !s) return;
+    const members = new Set(s.members);
+    if (box.checked) members.add(box.dataset.user);
+    else members.delete(box.dataset.user);
+    serversAction(() => serversApi('PUT', `/${s.id}`, { members: [...members] }));
+  });
+}
+
+function renderAdmin() {
+  if (!$('#admin-dialog').open) return;
   $('#admin-users').replaceChildren(
     ...adminUsers.map((u) => {
       const li = document.createElement('li');
@@ -2535,41 +2939,6 @@ function bindAdmin() {
     $('#settings').close();
     openAdmin();
   });
-  $('#server-form').addEventListener('submit', (e) => {
-    e.preventDefault();
-    const name = $('#server-new').value.trim();
-    if (!name) return;
-    adminAction(async () => {
-      const s = await adminApi('POST', '/servers', { name });
-      $('#server-new').value = '';
-      // Já abre a lista de membros do servidor novo; a lista nova de servidores chega pelo WebSocket.
-      adminExpanded = s.id;
-      renderAdmin();
-    });
-  });
-  $('#admin-servers').addEventListener('click', (e) => {
-    const b = e.target.closest('[data-act]');
-    const s = state.servers.get(e.target.closest('[data-server]')?.dataset.server);
-    if (!b || !s) return;
-    if (b.dataset.act === 'rename') {
-      const name = prompt('Nome novo do servidor:', s.name)?.trim();
-      if (name && name !== s.name) adminAction(() => adminApi('PUT', `/servers/${s.id}`, { name }));
-    } else if (b.dataset.act === 'members') {
-      adminExpanded = adminExpanded === s.id ? null : s.id;
-      renderAdmin();
-    } else if (b.dataset.act === 'delete' && confirm(`Apagar o servidor ${s.name}, com todos os canais, mensagens e imagens dele? Não dá para desfazer.`)) {
-      adminAction(() => adminApi('DELETE', `/servers/${s.id}`));
-    }
-  });
-  $('#admin-servers').addEventListener('change', (e) => {
-    const box = e.target.closest('input[data-user]');
-    const s = state.servers.get(e.target.closest('[data-server]')?.dataset.server);
-    if (!box || !s) return;
-    const members = new Set(s.members);
-    if (box.checked) members.add(box.dataset.user);
-    else members.delete(box.dataset.user);
-    adminAction(() => adminApi('PUT', `/servers/${s.id}`, { members: [...members] }));
-  });
   $('#admin-users').addEventListener('click', (e) => {
     const b = e.target.closest('[data-act]');
     const u = adminUsers.find((x) => x.id === e.target.closest('[data-user]')?.dataset.user);
@@ -2577,7 +2946,7 @@ function bindAdmin() {
     if (b.dataset.act === 'role') {
       const ask = u.admin
         ? `Tirar o cargo de admin de ${u.name}?`
-        : `Tornar ${u.name} admin? A pessoa vai poder criar servidores, mudar membros, trocar senhas, apagar contas, tirar sons da mesa e arrastar canais e pessoas.`;
+        : `Tornar ${u.name} admin? A pessoa vai poder mutar, expulsar e banir quem não é admin, trocar senhas, apagar contas, tirar sons da mesa e arrastar canais e pessoas.`;
       if (!confirm(ask)) return;
       adminAction(async () => {
         await adminApi('PUT', `/users/${u.id}/admin`, { admin: !u.admin });
@@ -3185,11 +3554,11 @@ async function openSettings() {
   $('#set-name').value = state.participants.get(state.me.id)?.name || '';
   const role = state.account?.host ? ' (host)' : state.account?.admin ? ' (admin)' : '';
   $('#set-email').textContent = `Conta: ${state.account?.email || ''}${role}`;
-  // A senha do host fica no .env do servidor.
-  $('#pw-change').hidden = !!state.account?.host;
+  $('#pw-change').hidden = false;
   $('#pw-change').open = false;
   $('#pw-error').textContent = '';
   $('#btn-admin').hidden = !state.account?.admin;
+  $('#btn-servers').hidden = !state.account?.host;
   $('#set-noise').checked = settings.noise;
   $('#set-quality').value = settings.quality;
   $('#set-autowatch').checked = settings.autoWatch;
@@ -3323,6 +3692,7 @@ function bindRoomUi() {
   $('#people').addEventListener('input', onPeopleInput);
   bindChannels();
   bindAdmin();
+  bindServersPanel();
 
   $('#music-form').addEventListener('submit', (e) => {
     e.preventDefault();

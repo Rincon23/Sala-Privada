@@ -11,16 +11,24 @@ import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import express from 'express';
+import nodemailer from 'nodemailer';
 import { WebSocketServer } from 'ws';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.PORT) || 8380;
 const APP_ID = (process.env.REALTIME_APP_ID || '').trim();
 const APP_SECRET = (process.env.REALTIME_APP_SECRET || '').trim();
-// Pedida uma vez só, para criar conta. Vazio = qualquer pessoa com o link cria conta.
-const ROOM_PASSWORD = process.env.ROOM_PASSWORD || '';
+// Quem criar a conta com este e-mail (e confirmar) é o host.
 const ADMIN_EMAIL = cleanEmail(process.env.ADMIN_EMAIL);
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+// Endereço do site nos links dos e-mails. Vazio = o endereço por onde o pedido chegou.
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').trim().replace(/\/+$/, '');
+const SMTP_HOST = (process.env.SMTP_HOST || '').trim();
+const SMTP_PORT = Number(process.env.SMTP_PORT) || 465;
+const SMTP_USER = (process.env.SMTP_USER || '').trim();
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const MAIL_FROM = (process.env.MAIL_FROM || '').trim();
+const VERIFY_MS = 24 * 3_600_000; // o link de confirmar o e-mail vale 24 h
+const RESET_MS = 3_600_000; // o de trocar a senha, 1 h
 const LIMIT_GB = Number(process.env.MONTHLY_LIMIT_GB) || 900;
 const FILE_TTL_HOURS = Number(process.env.FILE_TTL_HOURS) || 24;
 const FILE_MAX_GB = Number(process.env.FILE_MAX_GB) || 10;
@@ -38,7 +46,7 @@ const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const LOGINS_FILE = path.join(DATA_DIR, 'sessions.json');
 const SERVERS_FILE = path.join(DATA_DIR, 'servers.json');
 const SESSION_DAYS = 180;
-const MAIN_SERVER = 'principal'; // o servidor aberto a todas as contas
+const MAIN_SERVER = 'principal'; // o primeiro servidor, criado sozinho na primeira vez
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const ATTACH_DIR = path.join(DATA_DIR, 'attachments');
@@ -194,7 +202,7 @@ const files = new Map();
 const sounds = new Map();
 const users = new Map(); // id -> { id, email, name, passHash, createdAt }
 const logins = new Map(); // token do cookie de login -> { userId, createdAt }
-const servers = new Map(); // id -> { id, name, createdAt, members: [ids das contas] | null (aberto a todos) }
+const servers = new Map(); // id -> { id, name, createdAt, invite, members: [ids das contas], banned: [ids das contas] }
 const channels = new Map(); // id -> { id, serverId, kind: 'text' | 'voice', name, createdAt, createdBy }
 const messages = new Map(); // id do canal -> mensagens em ordem (ficam salvas em data/messages)
 const attachments = new Map(); // id do anexo -> dados, só dos que já estão numa mensagem
@@ -213,6 +221,10 @@ function publicParticipant(p) {
     deafened: p.deafened,
     online: p.online,
     joinedAt: p.joinedAt,
+    userId: p.userId,
+    admin: !!p.admin,
+    host: !!p.host,
+    muted: !!users.get(p.userId)?.muted,
   };
 }
 
@@ -238,7 +250,7 @@ function broadcast(msg, exceptId) {
   }
 }
 
-// Só para quem enxerga o canal (servidores novos têm membros escolhidos pelo admin).
+// Só para quem enxerga o canal (só os membros do servidor dele).
 function broadcastChannel(channelId, msg) {
   const data = JSON.stringify(msg);
   for (const p of participants.values()) {
@@ -322,8 +334,9 @@ function handleJoin(ws, msg) {
   p.name = name;
   p.userId = user.id;
   p.admin = isAdmin(user);
+  p.host = isHost(user);
   p.device = ws.device;
-  p.micOn = !!msg.micOn;
+  p.micOn = !!msg.micOn && !user.muted;
   p.deafened = !!msg.deafened;
   ws.pid = p.id;
 
@@ -627,8 +640,9 @@ async function loadSounds() {
 }
 
 // ---------- contas ----------
-// Cada pessoa entra com e-mail e senha. A senha só fica guardada como hash (scrypt) em data/users.json;
-// quem entra ganha um cookie com um token guardado em data/sessions.json. A conta de admin vem do .env.
+// Cada pessoa cria a conta com e-mail e senha e confirma o e-mail pelo link que chega. A senha só fica
+// guardada como hash (scrypt) em data/users.json; quem entra ganha um cookie com um token guardado em
+// data/sessions.json. Quem confirmar o ADMIN_EMAIL do .env é o host.
 
 const scryptAsync = promisify(scrypt);
 
@@ -637,13 +651,96 @@ function cleanEmail(email) {
 }
 
 const validEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-// O host é a conta do .env e só ele dá e tira o cargo de admin; quem recebe pode todo o resto.
-const isHost = (user) => !!user && !!ADMIN_EMAIL && user.email === ADMIN_EMAIL;
+// O host dá e tira o cargo de admin; quem recebe pode todo o resto.
+const isHost = (user) => !!user?.verified && !!ADMIN_EMAIL && user.email === ADMIN_EMAIL;
 const isAdmin = (user) => isHost(user) || !!user?.admin;
 const userByEmail = (email) => [...users.values()].find((u) => u.email === email);
 
 function publicUser(u) {
-  return { id: u.id, email: u.email, name: u.name, admin: isAdmin(u), host: isHost(u), createdAt: u.createdAt };
+  return { id: u.id, email: u.email, name: u.name, admin: isAdmin(u), host: isHost(u), verified: !!u.verified, muted: !!u.muted, createdAt: u.createdAt };
+}
+
+// Links de uso único (confirmar o e-mail, trocar a senha). Só o hash do token fica guardado na conta.
+const tokenHash = (token) => createHash('sha256').update(String(token ?? '')).digest('hex');
+
+function issueToken(user, kind, ms) {
+  const token = newId(24);
+  user[kind] = { hash: tokenHash(token), exp: Date.now() + ms };
+  saveUsers();
+  return token;
+}
+
+function userByToken(kind, token) {
+  const hash = tokenHash(token);
+  return [...users.values()].find((u) => u[kind]?.hash === hash && u[kind].exp > Date.now()) || null;
+}
+
+const siteUrl = (req) => PUBLIC_URL || `${isHttps(req) ? 'https' : 'http'}://${req.get('host')}`;
+
+function sendConfirm(req, user) {
+  const url = `${siteUrl(req)}/#confirmar=${issueToken(user, 'verify', VERIFY_MS)}`;
+  return sendMail(
+    user.email,
+    'Confirme seu e-mail na Sala Privada',
+    `Oi, ${user.name}!\n\nPara ativar sua conta na Sala Privada, abra o link abaixo:\n\n${url}\n\n` +
+      'O link vale por 24 horas. Se não foi você que criou a conta, é só ignorar este e-mail.',
+  );
+}
+
+function sendReset(req, user) {
+  const url = `${siteUrl(req)}/#senha=${issueToken(user, 'reset', RESET_MS)}`;
+  return sendMail(
+    user.email,
+    'Trocar a senha da Sala Privada',
+    `Oi, ${user.name}!\n\nPediram para trocar a senha da sua conta na Sala Privada. Para escolher uma senha nova, abra o link abaixo:\n\n${url}\n\n` +
+      'O link vale por 1 hora. Se não foi você, ignore este e-mail: sua senha continua a mesma.',
+  );
+}
+
+// ---------- e-mails ----------
+// Saem pelo SMTP do .env (Gmail: smtp.gmail.com, porta 465 e uma "senha de app"). Sem SMTP_HOST,
+// o e-mail só aparece no log, para dar para seguir os links testando no PC.
+
+let mailer = null;
+const mailSent = new Map(); // chave -> horários dos últimos envios
+
+// A mesma caixa recebe no máximo 3 por hora, e o servidor manda no máximo 30 por hora e 200 por dia:
+// ninguém consegue gastar a cota do Gmail (nem sujar o nome dele) criando contas com o e-mail dos outros.
+function allowMail(key, max, ms) {
+  const now = Date.now();
+  const recent = (mailSent.get(key) || []).filter((at) => at > now - ms);
+  const ok = recent.length < max;
+  if (ok) recent.push(now);
+  mailSent.set(key, recent);
+  return ok;
+}
+
+async function sendMail(to, subject, text) {
+  if (!allowMail(`to:${to}`, 3, 3_600_000)) {
+    log('AVISO', null, `${to} já recebeu 3 e-mails nesta hora; este não foi enviado`);
+    return false;
+  }
+  if (!allowMail('hour', 30, 3_600_000) || !allowMail('day', 200, 86_400_000)) {
+    log('AVISO', null, `passou do limite de e-mails (30 por hora ou 200 por dia); o e-mail para ${to} não foi enviado`, 'nada se foi um pico de cadastros. Se não, alguém pode estar criando contas com o e-mail dos outros: veja as contas no painel de admin');
+    return false;
+  }
+  if (!SMTP_HOST) {
+    log('INFO', null, `e-mail que sairia para ${to} (sem SMTP no .env): ${subject}\n${text}`);
+    return true;
+  }
+  mailer ??= nodemailer.createTransport({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_PORT === 465, auth: { user: SMTP_USER, pass: SMTP_PASS } });
+  try {
+    await mailer.sendMail({ from: MAIL_FROM || `Sala Privada <${SMTP_USER}>`, to, subject, text });
+    return true;
+  } catch (err) {
+    log(
+      'ERRO',
+      null,
+      `não consegui mandar o e-mail para ${to} (${err.message})`,
+      'confira SMTP_HOST, SMTP_USER e SMTP_PASS no .env (no Gmail, SMTP_PASS é uma "senha de app") e rode "docker compose up -d --force-recreate"',
+    );
+    return false;
+  }
 }
 
 async function hashPassword(password) {
@@ -674,6 +771,14 @@ async function loadUsers() {
   } catch {
     // ainda não há contas
   }
+  const stale = Date.now() - 7 * 86_400_000;
+  for (const u of [...users.values()]) {
+    // Contas de antes da confirmação por e-mail já valem.
+    u.verified ??= true;
+    // Cadastro nunca confirmado (e-mail errado, ou de outra pessoa) some depois de 7 dias.
+    if (!u.verified && u.createdAt < stale) users.delete(u.id);
+  }
+  await saveUsers();
   const cutoff = Date.now() - SESSION_DAYS * 86_400_000;
   try {
     for (const [token, s] of JSON.parse(await readFile(LOGINS_FILE, 'utf8'))) {
@@ -682,16 +787,6 @@ async function loadUsers() {
   } catch {
     // ninguém entrou ainda
   }
-  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return;
-  // A conta de admin é criada na primeira vez e a senha dela é sempre a do .env.
-  let admin = userByEmail(ADMIN_EMAIL);
-  if (!admin) {
-    admin = { id: newId(), email: ADMIN_EMAIL, name: cleanName(ADMIN_EMAIL.split('@')[0]) || 'Admin', createdAt: Date.now() };
-    users.set(admin.id, admin);
-    log('INFO', null, `conta de admin criada para ${ADMIN_EMAIL}`);
-  }
-  if (!(await checkPassword(ADMIN_PASSWORD, admin.passHash))) admin.passHash = await hashPassword(ADMIN_PASSWORD);
-  await saveUsers();
 }
 
 const isHttps = (req) => req.get('x-forwarded-proto') === 'https';
@@ -742,15 +837,37 @@ function failed(req) {
 }
 
 // ---------- servidores ----------
-// O servidor principal é aberto a todas as contas; nos outros, o admin escolhe quem entra.
+// Cada servidor tem os seus membros. Quem não é membro entra pelo link (ou código) de convite do servidor;
+// o host enxerga e cuida de todos. Admins expulsam, banem e mutam pessoas nos servidores em que estão.
 
-function publicServer(s) {
-  return { id: s.id, name: s.name, createdAt: s.createdAt, open: s.members === null, members: s.members || [] };
+const newInvite = () => randomBytes(6).toString('base64url').replace(/[-_]/g, 'x');
+
+function publicServer(s, p) {
+  const out = { id: s.id, name: s.name, createdAt: s.createdAt, members: s.members };
+  // O convite fica com quem cuida da sala; a lista de banidos, só com o host.
+  if (p?.admin || p?.host) out.invite = s.invite;
+  if (p?.host) out.banned = s.banned;
+  return out;
 }
 
 function canSee(p, serverId) {
   const s = servers.get(serverId);
-  return !!s && (s.members === null || p.admin || s.members.includes(p.userId));
+  return !!s && (!!p.host || s.members.includes(p.userId));
+}
+
+const serverByInvite = (code) => (code ? [...servers.values()].find((s) => s.invite === code) : null) || null;
+
+// Aceita o código sozinho ou o link inteiro (…/convite/CODIGO ou …#convite=CODIGO).
+function cleanInvite(value) {
+  const text = String(value ?? '').trim();
+  const m = /convite[=/]([\w-]{4,32})/.exec(text);
+  return (m ? m[1] : text).slice(0, 32);
+}
+
+// Admin mexe em quem não é admin; o host, em todos (menos nele mesmo).
+function canManage(actor, user) {
+  if (!actor?.admin || !user || user.id === actor.userId || isHost(user)) return false;
+  return !isAdmin(user) || !!actor.host;
 }
 
 function canSeeChannel(p, channelId) {
@@ -763,13 +880,13 @@ function directoryFor(p) {
   const visible = [...servers.values()].filter((s) => canSee(p, s.id));
   const ids = new Set(visible.map((s) => s.id));
   return {
-    servers: visible.map(publicServer),
+    servers: visible.map((s) => publicServer(s, p)),
     channels: [...channels.values()].filter((c) => ids.has(c.serverId)).map(publicChannel),
     musics: Object.fromEntries([...musics].filter(([id]) => ids.has(channels.get(id)?.serverId)).map(([id, m]) => [id, musicState(m)])),
   };
 }
 
-// Depois que o admin mexe em servidores ou membros: quem perdeu acesso sai da sala de voz, e todos recebem a lista nova.
+// Depois de mexer em servidores ou membros: quem perdeu acesso sai da sala de voz, e todos recebem a lista nova.
 function refreshDirectories() {
   for (const p of participants.values()) {
     if (p.voice && !canSeeChannel(p, p.voice)) moveVoice(p, null);
@@ -787,8 +904,14 @@ async function loadServers() {
   } catch {
     // primeira vez: só o principal, logo abaixo
   }
-  if (!servers.has(MAIN_SERVER)) servers.set(MAIN_SERVER, { id: MAIN_SERVER, name: 'Sala Privada', createdAt: Date.now(), members: null });
-  servers.get(MAIN_SERVER).members = null;
+  if (!servers.size) servers.set(MAIN_SERVER, { id: MAIN_SERVER, name: 'Sala Privada', createdAt: Date.now(), members: [] });
+  for (const s of servers.values()) {
+    // Antes dos convites o principal era aberto a todos: quem já tinha conta continua dentro.
+    if (!Array.isArray(s.members)) s.members = [...users.keys()];
+    s.members = s.members.filter((id) => users.has(id));
+    s.banned = (s.banned || []).filter((id) => users.has(id));
+    s.invite ||= newInvite();
+  }
   await saveServers();
 }
 
@@ -843,15 +966,19 @@ async function loadChannels() {
   try {
     for (const c of JSON.parse(await readFile(CHANNELS_FILE, 'utf8'))) {
       if (!/^[\w-]{1,32}$/.test(c.id) || (c.kind !== 'text' && c.kind !== 'voice')) continue;
-      // Canais de antes dos servidores (ou de um servidor que sumiu) ficam no principal.
-      if (!servers.has(c.serverId)) c.serverId = MAIN_SERVER;
+      // Canais de antes dos servidores ficam no principal; os de um servidor que sumiu, somem.
+      if (!c.serverId && servers.has(MAIN_SERVER)) c.serverId = MAIN_SERVER;
+      if (!servers.has(c.serverId)) continue;
       channels.set(c.id, c);
     }
   } catch {
     // primeira vez: cria os canais padrão logo abaixo
   }
-  for (const [kind, name] of [['text', 'geral'], ['voice', 'Geral']]) {
-    if (![...channels.values()].some((c) => c.serverId === MAIN_SERVER && c.kind === kind)) addChannel(MAIN_SERVER, kind, name, null);
+  // Todo servidor tem pelo menos um canal de texto e uma sala de voz.
+  for (const serverId of servers.keys()) {
+    for (const [kind, name] of [['text', 'geral'], ['voice', 'Geral']]) {
+      if (![...channels.values()].some((c) => c.serverId === serverId && c.kind === kind)) addChannel(serverId, kind, name, null);
+    }
   }
   // Canais de antes da ordem por arrasto ficam na ordem em que foram criados.
   for (const serverId of servers.keys()) {
@@ -947,7 +1074,7 @@ function validStream(s) {
 
 const handlers = {
   update(p, msg) {
-    if (typeof msg.micOn === 'boolean') p.micOn = msg.micOn;
+    if (typeof msg.micOn === 'boolean') p.micOn = msg.micOn && !users.get(p.userId)?.muted;
     if (typeof msg.deafened === 'boolean') p.deafened = msg.deafened;
     // O nome é o da conta: trocar aqui troca para sempre.
     const name = msg.name !== undefined && cleanName(msg.name);
@@ -975,7 +1102,7 @@ const handlers = {
   'channel:create'(p, msg) {
     const kind = msg.kind === 'voice' ? 'voice' : 'text';
     const name = cleanName(msg.name);
-    const serverId = String(msg.serverId ?? MAIN_SERVER);
+    const serverId = String(msg.serverId ?? '');
     if (!name || !canSee(p, serverId)) return;
     if (channels.size >= CHANNELS_MAX * servers.size) return send(p.ws, { type: 'notice', text: 'Canais demais. Apague algum antes.' });
     const c = addChannel(serverId, kind, name, p.name);
@@ -1029,9 +1156,85 @@ const handlers = {
     log('INFO', who(p), `moveu ${target.name} para a sala de voz "${channels.get(id).name}"`);
   },
 
+  // Entrar num servidor com o código (ou link) de convite.
+  'server:join'(p, msg) {
+    const now = Date.now();
+    p.inviteTries = (p.inviteTries || []).filter((at) => at > now - 10 * 60_000);
+    if (p.inviteTries.length >= 10) return send(p.ws, { type: 'invite:error', text: 'Muitos códigos errados. Espere uns 10 minutos.' });
+    const s = serverByInvite(cleanInvite(msg.code));
+    if (!s) {
+      p.inviteTries.push(now);
+      return send(p.ws, { type: 'invite:error', text: 'Esse convite não existe (ou foi trocado). Peça um link novo para o dono do site.' });
+    }
+    if (s.banned.includes(p.userId)) return send(p.ws, { type: 'invite:error', text: `Você foi banido de ${s.name}.` });
+    const already = s.members.includes(p.userId) || !!p.host;
+    if (!s.members.includes(p.userId)) {
+      s.members.push(p.userId);
+      saveServers();
+      log('INFO', who(p), `entrou no servidor "${s.name}" pelo convite`);
+      // Os outros aparelhos da pessoa e os membros (que veem a lista de membros) recebem a lista nova.
+      for (const other of participants.values()) if (canSee(other, s.id)) send(other.ws, { type: 'directory', ...directoryFor(other) });
+    }
+    send(p.ws, { type: 'server:joined', id: s.id, name: s.name, already });
+  },
+
+  // Expulsar (ou banir) alguém do servidor: a pessoa sai dele na hora. Expulsa, pode voltar pelo convite; banida, não.
+  'member:kick'(p, msg) {
+    const s = servers.get(String(msg.serverId ?? ''));
+    const user = users.get(String(msg.userId ?? ''));
+    if (!s || !user || !canSee(p, s.id)) return;
+    if (!canManage(p, user)) return send(p.ws, { type: 'notice', text: 'Você não pode fazer isso com essa pessoa.' });
+    const ban = !!msg.ban;
+    if (!s.members.includes(user.id) && !ban) return send(p.ws, { type: 'notice', text: `${user.name} não é membro de ${s.name}.` });
+    s.members = s.members.filter((id) => id !== user.id);
+    if (ban && !s.banned.includes(user.id)) s.banned.push(user.id);
+    saveServers();
+    refreshDirectories();
+    for (const other of participants.values()) {
+      if (other.userId === user.id) send(other.ws, { type: 'notice', text: `${p.name} ${ban ? 'te baniu' : 'te expulsou'} de ${s.name}.` });
+    }
+    send(p.ws, { type: 'notice', text: `${user.name} ${ban ? 'foi banido' : 'foi expulso'} de ${s.name}.` });
+    log('AVISO', who(p), `${ban ? 'baniu' : 'expulsou'} ${user.name} (${user.email}) do servidor "${s.name}"`);
+  },
+
+  // Mutar alguém: o microfone dessa conta para de chegar nos outros até um admin desmutar.
+  'member:mute'(p, msg) {
+    const user = users.get(String(msg.userId ?? ''));
+    if (!user) return;
+    if (!canManage(p, user)) return send(p.ws, { type: 'notice', text: 'Você não pode fazer isso com essa pessoa.' });
+    user.muted = !!msg.muted;
+    saveUsers();
+    for (const other of [...participants.values()]) {
+      if (other.userId !== user.id) continue;
+      if (user.muted) {
+        other.micOn = false;
+        for (const st of [...streams.values()]) {
+          if (st.ownerId !== other.id || st.kind !== 'mic') continue;
+          streams.delete(st.id);
+          broadcast({ type: 'stream:removed', id: st.id });
+        }
+      }
+      send(other.ws, { type: 'account', account: publicUser(user), by: p.name });
+      broadcast({ type: 'participant:updated', participant: publicParticipant(other) });
+    }
+    log('INFO', who(p), `${user.muted ? 'mutou' : 'desmutou'} ${user.name} (${user.email})`);
+  },
+
+  // Tirar alguém da sala de voz (sem tirar do servidor).
+  'voice:kick'(p, msg) {
+    const target = participants.get(String(msg.pid ?? ''));
+    if (!target?.voice || !canSeeChannel(p, target.voice)) return;
+    if (!canManage(p, users.get(target.userId))) return send(p.ws, { type: 'notice', text: 'Você não pode fazer isso com essa pessoa.' });
+    const room = channels.get(target.voice)?.name || 'a sala de voz';
+    moveVoice(target, null);
+    send(target.ws, { type: 'voice:ended', text: `${p.name} te tirou de ${room}.` });
+    log('INFO', who(p), `tirou ${target.name} da sala de voz "${room}"`);
+  },
+
   'stream:publish'(p, msg) {
     const s = validStream(msg.stream);
     if (!s || !p.voice) return;
+    if (s.kind === 'mic' && users.get(p.userId)?.muted) return;
     const owner = sessions.get(s.sessionId);
     if (owner && owner !== p.id) return;
     const existing = streams.get(s.id);
@@ -1238,7 +1441,6 @@ app.use(express.json({ limit: '512kb' }));
 
 app.get('/api/config', (req, res) => {
   res.json({
-    needsCode: !!ROOM_PASSWORD,
     realtimeReady: !!(APP_ID && APP_SECRET),
     iceServers: ICE_SERVERS,
     version: APP_VERSION,
@@ -1250,7 +1452,20 @@ app.get('/api/config', (req, res) => {
 
 app.get('/api/presence', (req, res) => {
   const list = [...participants.values()];
-  res.json({ count: list.length, names: ROOM_PASSWORD ? [] : list.map((p) => p.name) });
+  // Sem nomes: o site é aberto, e quem está na sala só aparece para quem é dos mesmos servidores.
+  res.json({ count: list.length });
+});
+
+// O nome do servidor do convite, para a tela de entrar mostrar para onde a pessoa foi chamada.
+app.get('/api/invite/:code', (req, res) => {
+  const s = serverByInvite(cleanInvite(req.params.code));
+  if (!s) return res.status(404).json({ errorCode: 'not_found', errorDescription: 'Esse convite não existe (ou foi trocado).' });
+  res.json({ name: s.name });
+});
+
+// O link de convite abre o site, que guarda o código e entra no servidor depois do login.
+app.get('/convite/:code', (req, res) => {
+  res.redirect(302, `/#convite=${encodeURIComponent(cleanInvite(req.params.code))}`);
 });
 
 // ---------- entrar, criar conta e painel de admin ----------
@@ -1270,20 +1485,33 @@ authRoutes.post('/register', async (req, res) => {
   const name = cleanName(req.body?.name);
   const email = cleanEmail(req.body?.email);
   const password = String(req.body?.password ?? '');
-  if (ROOM_PASSWORD && req.body?.code !== ROOM_PASSWORD) {
-    failed(req);
-    return fail(res, 403, 'code', 'Senha da sala incorreta. Peça para quem cuida da sala.');
-  }
-  if (!name) return fail(res, 400, 'name', 'Escolha um nome.');
+  if (!name) return fail(res, 400, 'name', 'Escolha um nome ou apelido.');
   if (!validEmail(email)) return fail(res, 400, 'email', 'Esse e-mail não parece certo.');
   if (password.length < 6) return fail(res, 400, 'password', 'A senha precisa ter pelo menos 6 caracteres.');
+  let user = userByEmail(email);
+  if (user?.verified) return fail(res, 409, 'exists', 'Já existe uma conta com esse e-mail. Entre com ela ou use "Esqueci minha senha".');
   const passHash = await hashPassword(password);
-  if (userByEmail(email)) return fail(res, 409, 'exists', 'Já existe uma conta com esse e-mail. Use "Entrar".');
-  const user = { id: newId(), email, name, passHash, createdAt: Date.now() };
-  users.set(user.id, user);
+  // Cadastro que nunca foi confirmado (e-mail digitado errado, ou alguém usando o e-mail dos outros): recomeça.
+  if (!user) {
+    user = { id: newId(), email, createdAt: Date.now() };
+    users.set(user.id, user);
+  }
+  Object.assign(user, { name, passHash, verified: false });
+  saveUsers();
+  if (!(await sendConfirm(req, user))) return fail(res, 503, 'mail', 'Não deu para mandar o e-mail de confirmação agora. Tente de novo daqui a pouco.');
+  log('INFO', null, `${name} criou uma conta (${email}); falta confirmar o e-mail`);
+  res.json({ pending: true, email });
+});
+
+// O link do e-mail abre o site com o token; o app manda para cá e já entra.
+authRoutes.post('/verify', (req, res) => {
+  const user = userByToken('verify', req.body?.token);
+  if (!user) return fail(res, 400, 'link', 'Esse link de confirmação expirou ou já foi usado. Entre com o seu e-mail e senha para receber outro.');
+  user.verified = true;
+  delete user.verify;
   saveUsers();
   startLogin(req, res, user);
-  log('INFO', null, `${name} criou uma conta (${email})`);
+  log('INFO', null, `${user.name} confirmou o e-mail (${user.email})${isHost(user) ? ' e é o host da sala' : ''}`);
   res.json(publicUser(user));
 });
 
@@ -1294,7 +1522,46 @@ authRoutes.post('/login', async (req, res) => {
     failed(req);
     return fail(res, 401, 'login', 'E-mail ou senha incorretos.');
   }
+  if (!user.verified) {
+    const sent = await sendConfirm(req, user);
+    const where = sent ? `Mandamos um link novo para ${user.email}` : `Procure o link que mandamos para ${user.email}`;
+    return fail(res, 403, 'unverified', `Falta confirmar o e-mail. ${where} (veja também o spam).`);
+  }
   startLogin(req, res, user);
+  res.json(publicUser(user));
+});
+
+// Responde sempre igual (e sem esperar o e-mail sair), para ninguém descobrir quais e-mails têm conta.
+authRoutes.post('/forgot', (req, res) => {
+  if (blocked(req)) return fail(res, 429, 'too_many', TOO_MANY);
+  const email = cleanEmail(req.body?.email);
+  if (!validEmail(email)) return fail(res, 400, 'email', 'Esse e-mail não parece certo.');
+  const user = userByEmail(email);
+  if (user) sendReset(req, user);
+  res.json({ ok: true });
+});
+
+authRoutes.post('/resend', (req, res) => {
+  const user = userByEmail(cleanEmail(req.body?.email));
+  if (user && !user.verified) sendConfirm(req, user);
+  res.json({ ok: true });
+});
+
+// Quem abriu o link do e-mail é dono dele: a conta fica confirmada e os outros aparelhos saem.
+authRoutes.post('/reset', async (req, res) => {
+  const user = userByToken('reset', req.body?.token);
+  if (!user) return fail(res, 400, 'link', 'Esse link expirou ou já foi usado. Peça outro em "Esqueci minha senha".');
+  const password = String(req.body?.password ?? '');
+  if (password.length < 6) return fail(res, 400, 'password', 'A senha precisa ter pelo menos 6 caracteres.');
+  user.passHash = await hashPassword(password);
+  user.verified = true;
+  delete user.reset;
+  delete user.verify;
+  saveUsers();
+  endLogins(user.id);
+  kickUser(user.id, 'A senha da sua conta foi trocada. Entre de novo com a senha nova.');
+  startLogin(req, res, user);
+  log('INFO', null, `${user.name} (${user.email}) trocou a senha pelo link do e-mail`);
   res.json(publicUser(user));
 });
 
@@ -1308,7 +1575,6 @@ authRoutes.post('/logout', (req, res) => {
 authRoutes.post('/password', async (req, res) => {
   const user = userFrom(req);
   if (!user) return fail(res, 401, 'unauthorized', 'Entre na sua conta de novo.');
-  if (isHost(user)) return fail(res, 400, 'admin', 'A senha do host fica no .env do servidor.');
   if (blocked(req)) return fail(res, 429, 'too_many', TOO_MANY);
   if (!(await checkPassword(req.body?.current, user.passHash))) {
     failed(req);
@@ -1340,7 +1606,7 @@ adminRoutes.get('/users', (req, res) => {
 
 // Os admins que o host escolheu não mexem nas contas uns dos outros (nem na do host).
 function protectedAccount(req, user) {
-  if (isHost(user)) return 'A conta do host fica no .env do servidor.';
+  if (isHost(user)) return 'Só o próprio host mexe na conta dele (em Configurações ou em "Esqueci minha senha").';
   if (isAdmin(user) && !isHost(req.user)) return 'Só o host mexe na conta de outro admin.';
   return null;
 }
@@ -1369,7 +1635,10 @@ adminRoutes.delete('/users/:id', (req, res) => {
   saveUsers();
   endLogins(user.id);
   kickUser(user.id, 'Sua conta foi apagada pelo admin.');
-  for (const s of servers.values()) if (s.members) s.members = s.members.filter((id) => id !== user.id);
+  for (const s of servers.values()) {
+    s.members = s.members.filter((id) => id !== user.id);
+    s.banned = s.banned.filter((id) => id !== user.id);
+  }
   saveServers();
   refreshDirectories();
   log('AVISO', null, `o admin apagou a conta de ${user.name} (${user.email})`);
@@ -1388,56 +1657,95 @@ adminRoutes.put('/users/:id/admin', (req, res) => {
     if (p.userId !== user.id) continue;
     p.admin = user.admin;
     send(p.ws, { type: 'account', account: publicUser(user) });
+    broadcast({ type: 'participant:updated', participant: publicParticipant(p) });
   }
-  // Admin enxerga todos os servidores; quem perdeu o cargo volta a ver só os seus.
+  // Admin vê o link de convite dos servidores em que está; quem perdeu o cargo deixa de ver.
   refreshDirectories();
   log('INFO', null, `o host ${user.admin ? 'deu' : 'tirou'} o cargo de admin ${user.admin ? 'para' : 'de'} ${user.name} (${user.email})`);
   res.json(publicUser(user));
 });
 
-// Servidor novo já vem com um canal de texto e uma sala de voz, e só com o admin dentro.
-adminRoutes.post('/servers', (req, res) => {
+app.use('/api/admin', adminRoutes);
+
+// ---------- painel de servidores (só o host) ----------
+
+const hostRoutes = express.Router();
+
+hostRoutes.use((req, res, next) => {
+  const user = userFrom(req);
+  if (!isHost(user)) return fail(res, 403, 'forbidden', 'Só o host cuida dos servidores.');
+  req.user = user;
+  next();
+});
+
+const hostView = { host: true, admin: true };
+
+// Servidor novo já vem com um canal de texto, uma sala de voz e um link de convite.
+hostRoutes.post('/', (req, res) => {
   const name = cleanName(req.body?.name);
   if (!name) return fail(res, 400, 'name', 'Escolha um nome para o servidor.');
   if (servers.size >= 20) return fail(res, 400, 'too_many', 'Já são 20 servidores. Apague algum antes.');
-  const s = { id: newId(), name, createdAt: Date.now(), members: [] };
+  const s = { id: newId(), name, createdAt: Date.now(), members: [], banned: [], invite: newInvite() };
   servers.set(s.id, s);
   addChannel(s.id, 'text', 'geral', req.user.name);
   addChannel(s.id, 'voice', 'Geral', req.user.name);
   saveServers();
   saveChannels();
   refreshDirectories();
-  log('INFO', null, `o admin criou o servidor "${name}"`);
-  res.json(publicServer(s));
+  log('INFO', null, `o host criou o servidor "${name}"`);
+  res.json(publicServer(s, hostView));
 });
 
-adminRoutes.put('/servers/:id', (req, res) => {
+hostRoutes.put('/:id', (req, res) => {
   const s = servers.get(req.params.id);
   if (!s) return fail(res, 404, 'not_found', 'Esse servidor não existe mais.');
   const name = req.body?.name !== undefined ? cleanName(req.body.name) : s.name;
   if (!name) return fail(res, 400, 'name', 'Escolha um nome para o servidor.');
   s.name = name;
-  // O principal é sempre aberto a todos; nos outros, só entra quem tem conta.
-  if (Array.isArray(req.body?.members) && s.members !== null) s.members = [...new Set(req.body.members.map(String))].filter((id) => users.has(id));
+  if (Array.isArray(req.body?.members)) {
+    s.members = [...new Set(req.body.members.map(String))].filter((id) => users.has(id) && !isHost(users.get(id)));
+    // Quem o host coloca de volta deixa de estar banido.
+    s.banned = s.banned.filter((id) => !s.members.includes(id));
+  }
   saveServers();
   refreshDirectories();
-  res.json(publicServer(s));
+  res.json(publicServer(s, hostView));
 });
 
-adminRoutes.delete('/servers/:id', (req, res) => {
+// Link novo: o antigo para de funcionar (quem já entrou continua dentro).
+hostRoutes.post('/:id/invite', (req, res) => {
+  const s = servers.get(req.params.id);
+  if (!s) return fail(res, 404, 'not_found', 'Esse servidor não existe mais.');
+  s.invite = newInvite();
+  saveServers();
+  refreshDirectories();
+  log('INFO', null, `o host trocou o link de convite de "${s.name}"`);
+  res.json(publicServer(s, hostView));
+});
+
+hostRoutes.delete('/:id/banned/:userId', (req, res) => {
+  const s = servers.get(req.params.id);
+  if (!s) return fail(res, 404, 'not_found', 'Esse servidor não existe mais.');
+  s.banned = s.banned.filter((id) => id !== req.params.userId);
+  saveServers();
+  refreshDirectories();
+  res.json(publicServer(s, hostView));
+});
+
+hostRoutes.delete('/:id', (req, res) => {
   const s = servers.get(req.params.id);
   if (!s) return res.json({ ok: true });
-  if (s.id === MAIN_SERVER) return fail(res, 400, 'main', 'O servidor principal não pode ser apagado.');
+  if (servers.size <= 1) return fail(res, 400, 'last', 'Precisa sobrar pelo menos um servidor.');
   let count = 0;
   for (const c of [...channels.values()]) if (c.serverId === s.id) count += deleteChannel(c);
   servers.delete(s.id);
   saveServers();
   refreshDirectories();
-  log('AVISO', null, `o admin apagou o servidor "${s.name}"${count ? ` e as ${count} mensagens dele` : ''}`);
+  log('AVISO', null, `o host apagou o servidor "${s.name}"${count ? ` e as ${count} mensagens dele` : ''}`);
   res.json({ ok: true });
 });
 
-app.use('/api/admin', adminRoutes);
+app.use('/api/servers', hostRoutes);
 
 function participantFrom(value) {
   const [pid, token] = String(value || '').split(':');
@@ -1902,8 +2210,17 @@ server.listen(PORT, () => {
   if (!APP_ID || !APP_SECRET) {
     log('AVISO', null, 'sem as chaves do Cloudflare Realtime: voz, câmera e telas estão desligados', 'preencha REALTIME_APP_ID e REALTIME_APP_SECRET no .env e rode "docker compose up -d --force-recreate"');
   }
-  if (!ROOM_PASSWORD) log('AVISO', null, 'a sala está sem senha: qualquer pessoa com o link cria uma conta e entra', 'se quiser, preencha ROOM_PASSWORD no .env (ela é pedida para criar conta)');
-  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
-    log('AVISO', null, 'não há conta de admin: ninguém consegue criar servidores nem trocar senhas', 'preencha ADMIN_EMAIL e ADMIN_PASSWORD no .env e rode "docker compose up -d --force-recreate"');
+  if (!ADMIN_EMAIL) {
+    log('AVISO', null, 'não há host: ninguém consegue criar servidores, dar o cargo de admin nem trocar senhas', 'preencha ADMIN_EMAIL no .env, rode "docker compose up -d --force-recreate" e crie a conta com esse e-mail');
+  } else if (![...users.values()].some(isHost)) {
+    log('INFO', null, `o host (${ADMIN_EMAIL}) ainda não tem conta: é só criar a conta com esse e-mail e confirmar pelo link que chega`);
+  }
+  if (!SMTP_HOST) {
+    log(
+      'AVISO',
+      null,
+      'sem SMTP: os e-mails de confirmar conta e de trocar senha só aparecem neste log',
+      'preencha SMTP_HOST, SMTP_USER e SMTP_PASS no .env (Gmail: smtp.gmail.com e uma senha de app de myaccount.google.com/apppasswords) e rode "docker compose up -d --force-recreate"',
+    );
   }
 });

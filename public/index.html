@@ -22,38 +22,50 @@
 <body>
   <section id="join" class="join">
     <form id="join-form" class="join-card" autocomplete="on">
-      <img class="join-logo" src="/icons/icon.svg" alt="" width="56" height="56">
-      <h1>Sala Privada</h1>
-      <p class="sub">Voz, vídeo, telas e música com a galera.</p>
-
-      <div class="auth-tabs" role="tablist">
-        <button class="auth-tab" type="button" role="tab" data-mode="login">Entrar</button>
-        <button class="auth-tab" type="button" role="tab" data-mode="register">Criar conta</button>
+      <div class="join-head">
+        <img class="join-logo" src="/icons/icon.svg" alt="" width="60" height="60">
+        <h1 id="join-title">Entrar</h1>
+        <p class="sub" id="join-sub">Que bom te ver de novo.</p>
       </div>
+
+      <div class="join-invite" id="join-invite" hidden><span data-icon="link"></span><p id="join-invite-text"></p></div>
 
       <div class="field" id="field-name" hidden>
         <label for="join-name">Seu nome</label>
-        <input id="join-name" class="input" maxlength="32" placeholder="Como te chamam?" autocomplete="nickname">
+        <input id="join-name" class="input" maxlength="32" placeholder="Nome ou apelido" autocomplete="nickname">
+        <p class="hint">É o que aparece na sala. Dá para trocar depois em Configurações.</p>
       </div>
-      <div class="field">
+      <div class="field" id="field-email">
         <label for="join-email">E-mail</label>
-        <input id="join-email" class="input" type="email" maxlength="120" autocomplete="email" required>
+        <input id="join-email" class="input" type="email" maxlength="120" placeholder="voce@email.com" autocomplete="email">
       </div>
-      <div class="field">
-        <label for="join-pass">Senha</label>
-        <input id="join-pass" class="input" type="password" autocomplete="current-password" required>
-      </div>
-      <div class="field" id="field-code" hidden>
-        <label for="join-code">Senha da sala</label>
-        <input id="join-code" class="input" type="password" autocomplete="off">
-        <p class="hint">Pergunte para quem cuida da sala. Ela só é pedida para criar a conta.</p>
+      <div class="field" id="field-pass">
+        <div class="field-head">
+          <label for="join-pass" id="join-pass-label">Senha</label>
+          <button class="link-btn" type="button" id="forgot-link">Esqueci minha senha</button>
+        </div>
+        <div class="pass-wrap">
+          <input id="join-pass" class="input" type="password" autocomplete="current-password">
+          <button class="icon-btn sm pass-toggle" type="button" id="pass-toggle" aria-label="Mostrar a senha" title="Mostrar a senha" data-icon="eye"></button>
+        </div>
       </div>
 
-      <label class="toggle-row"><span class="toggle-text"><span data-icon="mic"></span>Microfone ligado ao entrar na voz</span><input type="checkbox" class="switch" id="join-mic"></label>
-      <label class="toggle-row"><span class="toggle-text"><span data-icon="video"></span>Câmera ligada ao entrar na voz</span><input type="checkbox" class="switch" id="join-cam"></label>
+      <div class="join-sent" id="join-sent" hidden>
+        <div class="sent-icon" data-icon="mail"></div>
+        <p id="join-sent-text"></p>
+        <button class="btn secondary small" type="button" id="resend-btn">Mandar o e-mail de novo</button>
+      </div>
+
+      <div class="join-prefs" id="join-prefs">
+        <span class="join-prefs-label">Ao entrar numa sala de voz</span>
+        <label class="chip"><input type="checkbox" id="join-mic"><span data-icon="mic"></span>Microfone ligado</label>
+        <label class="chip"><input type="checkbox" id="join-cam"><span data-icon="video"></span>Câmera ligada</label>
+      </div>
 
       <p class="form-error" id="join-error" role="alert"></p>
-      <button class="btn block" id="join-btn" type="submit">Entrar</button>
+      <button class="btn block join-btn" id="join-btn" type="submit">Entrar</button>
+      <p class="join-switch"><span id="join-switch-text">Ainda não tem conta?</span> <button class="link-btn" type="button" id="switch-btn" data-mode="register">Criar conta</button></p>
+
       <button class="btn secondary block" type="button" data-install hidden><span data-icon="download"></span>Instalar o app</button>
 
       <p class="presence"><span class="dot-live"></span><span id="presence">Vendo quem está na sala…</span></p>
@@ -174,6 +186,24 @@
     <div class="sound-flash" id="sound-flash" hidden></div>
   </div>
 
+  <section class="join no-servers" id="no-servers" hidden>
+    <form class="join-card" id="no-servers-form" autocomplete="off">
+      <div class="join-head">
+        <img class="join-logo" src="/icons/icon.svg" alt="" width="60" height="60">
+        <h1>Que pena!</h1>
+        <p class="sub">Você ainda não está em nenhum servidor.</p>
+      </div>
+      <p class="no-servers-text">Para entrar, peça para o dono do site um link de convite. Se você recebeu um código ou link, cole aqui:</p>
+      <div class="field">
+        <label for="no-servers-code">Link ou código de convite</label>
+        <input id="no-servers-code" class="input" maxlength="200" placeholder="Ex.: Ab3dE6gH" required>
+      </div>
+      <p class="form-error" id="no-servers-error" role="alert"></p>
+      <button class="btn block join-btn" type="submit">Entrar no servidor</button>
+      <button class="btn secondary block" type="button" id="no-servers-logout"><span data-icon="leave"></span>Sair da conta</button>
+    </form>
+  </section>
+
   <div class="drop-overlay" id="drop-overlay" hidden><div>Solte para enviar à sala</div></div>
   <div class="banner" id="banner" hidden>Conexão perdida. Reconectando…</div>
   <div class="toasts" id="toasts" aria-live="polite"></div>
@@ -227,6 +257,7 @@
             <button class="btn secondary" type="button" id="pw-save">Trocar a senha</button>
           </div>
         </details>
+        <button class="btn secondary block" type="button" id="btn-servers" hidden><span data-icon="settings"></span>Gerenciar servidores</button>
         <button class="btn secondary block" type="button" id="btn-admin" hidden><span data-icon="users"></span>Painel de admin</button>
         <button class="btn secondary block" type="button" id="btn-exit"><span data-icon="leave"></span>Sair da conta</button>
       </div>
@@ -240,15 +271,27 @@
         <button class="icon-btn" type="button" id="admin-close" aria-label="Fechar" data-icon="x"></button>
       </div>
       <div class="dialog-body">
-        <h3 class="section-title">Servidores</h3>
+        <h3 class="section-title">Contas</h3>
+        <ul class="admin-list" id="admin-users"></ul>
+        <p class="form-error" id="admin-error" role="alert"></p>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="servers-dialog" aria-labelledby="servers-title">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h2 id="servers-title">Gerenciar servidores</h2>
+        <button class="icon-btn" type="button" id="servers-close" aria-label="Fechar" data-icon="x"></button>
+      </div>
+      <div class="dialog-body">
+        <p class="hint">Só o host vê este painel. Cada servidor tem um link de convite: quem abre, entra (ou cria a conta) e já cai no servidor.</p>
         <form class="inline-form admin-new" id="server-form">
           <input class="input" id="server-new" maxlength="32" placeholder="Nome do servidor novo" required autocomplete="off">
           <button class="btn" type="submit">Criar</button>
         </form>
-        <ul class="admin-list" id="admin-servers"></ul>
-        <h3 class="section-title">Contas</h3>
-        <ul class="admin-list" id="admin-users"></ul>
-        <p class="form-error" id="admin-error" role="alert"></p>
+        <ul class="admin-list" id="servers-list"></ul>
+        <p class="form-error" id="servers-error" role="alert"></p>
       </div>
     </div>
   </dialog>

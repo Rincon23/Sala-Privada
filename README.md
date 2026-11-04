@@ -2,9 +2,9 @@
 
 Uma sala só para a galera: canais de texto que guardam mensagens e imagens, salas de voz com câmera e quantas telas e janelas quiser, música do YouTube sincronizada em cada sala de voz. Cada pessoa entra com a própria conta (e-mail e senha) e dá para instalar como app no PC e no celular.
 
-- **Contas:** a pessoa cria a conta com nome, e-mail e senha (sem confirmar e-mail). Para criar, precisa da senha da sala (`ROOM_PASSWORD`); depois é só e-mail e senha, e o aparelho fica lembrado por 180 dias. Dá para trocar o nome e a senha em Configurações.
-- **Admin:** a conta do `ADMIN_EMAIL` é o host, com a senha do `ADMIN_PASSWORD`. Em Configurações → Painel de admin dá para criar servidores, escolher quem entra em cada um, dar uma senha nova para quem esqueceu e apagar contas. Só o host dá e tira o cargo de admin de outras contas; quem recebe pode todo o resto, menos mexer na conta de outro admin.
-- **Servidores:** o principal ("Sala Privada") é aberto a todas as contas. Os outros só aparecem para quem o admin colocar como membro. Troca-se de servidor clicando no nome dele, em cima da lista de canais.
+- **Contas:** qualquer pessoa cria a conta com nome (ou apelido), e-mail e senha, e confirma o e-mail pelo link que chega (vale 24 h). Depois é só e-mail e senha, e o aparelho fica lembrado por 180 dias. Quem esquece a senha recebe um link para trocar (vale 1 h). Dá para trocar o nome e a senha em Configurações. Cadastro nunca confirmado some em 7 dias.
+- **Host e admins:** quem criar a conta com o `ADMIN_EMAIL` (e confirmar) é o host. Só ele vê **Gerenciar servidores** (no menu do nome do servidor ou em Configurações): cria, renomeia e apaga servidores, copia ou troca o link de convite, coloca e tira membros e desbane. Só o host dá e tira o cargo de admin. Admins (e o host) clicam numa pessoa em **Pessoas** (ou numa sala de voz) para mutar, tirar da sala de voz, expulsar ou banir do servidor; em Configurações → Painel de admin trocam a senha de quem esqueceu e apagam contas. Admin não mexe em outro admin nem no host.
+- **Servidores e convites:** cada servidor tem um link de convite (`https://site/convite/CODIGO`). Quem abre o link entra ou cria a conta e já cai no servidor; também dá para colar o código em "Entrar com um convite", no menu do nome do servidor. Uma conta pode estar em quantos servidores quiser. Quem ainda não está em nenhum vê uma tela pedindo um convite ao dono do site. Expulso pode voltar pelo convite; banido não (até o host desbanir). Trocar o link faz o antigo parar de funcionar.
 - **Canais de texto:** qualquer pessoa cria, renomeia e apaga pelo **+** e pela engrenagem na lista à esquerda. Tudo fica guardado: texto, imagens (dá para colar com Ctrl+V ou arrastar para o chat) e arquivos de até 25 MB. Quem mandou pode apagar a própria mensagem.
 - **Salas de voz:** clicar numa sala entra nela. Cada sala tem a sua voz, câmeras, telas, música, mesa de sons e um chat ao lado. Quem está em outra sala não ouve nem vê nada, e o servidor também barra isso.
 
@@ -32,7 +32,7 @@ Primeira vez:
 ```bash
 git clone https://github.com/Rincon23/Sala-Privada.git ~/sala-privada
 cd ~/sala-privada
-cp .env.example .env   # e preencha as chaves do Realtime, ADMIN_EMAIL e ADMIN_PASSWORD
+cp .env.example .env   # e preencha as chaves do Realtime, ADMIN_EMAIL e o SMTP
 docker compose up -d --build
 ```
 
@@ -61,8 +61,10 @@ Depois recrie o container: `docker compose up -d --force-recreate`.
 
 | Variável | Para quê |
 |---|---|
-| `ADMIN_EMAIL` e `ADMIN_PASSWORD` | A conta de admin. Trocar a senha aqui (e recriar o container) troca a senha do admin. |
-| `ROOM_PASSWORD` | Senha da sala, pedida só para criar conta. Vazio = qualquer pessoa com o link cria conta. |
+| `ADMIN_EMAIL` | E-mail do host. Quem criar a conta com ele e confirmar é o host. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` | Por onde saem os e-mails de confirmar conta e de trocar senha. No Gmail: `smtp.gmail.com`, `465`, o Gmail e uma senha de app ([myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)). Sem isso, os e-mails só aparecem no log. |
+| `MAIL_FROM` | Remetente dos e-mails (padrão `Sala Privada <SMTP_USER>`). |
+| `PUBLIC_URL` | Endereço do site nos links dos e-mails (padrão: o endereço por onde a pessoa entrou). |
 | `MONTHLY_LIMIT_GB` | Quanto do plano grátis pode ser usado antes de pausar câmera e telas (padrão 900). |
 | `FILE_TTL_HOURS` | Depois de quantas horas um arquivo enviado some (padrão 24). |
 | `FILE_MAX_GB` | Tamanho máximo de cada arquivo (padrão 10). |
