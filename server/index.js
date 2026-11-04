@@ -1104,6 +1104,7 @@ const handlers = {
     const name = cleanName(msg.name);
     const serverId = String(msg.serverId ?? '');
     if (!name || !canSee(p, serverId)) return;
+    if (!p.admin) return send(p.ws, { type: 'notice', text: 'Só um admin cria canais.' });
     if (channels.size >= CHANNELS_MAX * servers.size) return send(p.ws, { type: 'notice', text: 'Canais demais. Apague algum antes.' });
     const c = addChannel(serverId, kind, name, p.name);
     saveChannels();
@@ -1115,6 +1116,7 @@ const handlers = {
     const c = channels.get(String(msg.id ?? ''));
     const name = cleanName(msg.name);
     if (!c || !name || name === c.name || !canSee(p, c.serverId)) return;
+    if (!p.admin) return send(p.ws, { type: 'notice', text: 'Só um admin renomeia canais.' });
     log('INFO', who(p), `renomeou o canal "${c.name}" para "${name}"`);
     c.name = name;
     saveChannels();
@@ -1124,6 +1126,7 @@ const handlers = {
   'channel:delete'(p, msg) {
     const c = channels.get(String(msg.id ?? ''));
     if (!c || !canSee(p, c.serverId)) return;
+    if (!p.admin) return send(p.ws, { type: 'notice', text: 'Só um admin apaga canais.' });
     if ([...channels.values()].filter((x) => x.serverId === c.serverId && x.kind === c.kind).length <= 1) {
       return send(p.ws, { type: 'notice', text: `Precisa sobrar pelo menos um canal de ${c.kind === 'voice' ? 'voz' : 'texto'}.` });
     }

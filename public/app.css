@@ -667,3 +667,4 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 .banned-row { padding: 6px 0; }
 #servers-dialog { width: min(600px, calc(100% - 32px)); }
 #servers-dialog .dialog-body > .hint { margin-bottom: 4px; }
+.channel-list:not(.can-edit) [data-add], .channel-list:not(.can-edit) .ch-edit { display: none; }

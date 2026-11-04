@@ -2081,6 +2081,8 @@ function renderChannels() {
   // Durante um arrasto a lista fica parada; ela é desenhada de novo ao soltar.
   if (!state.inRoom || channelDrag?.active) return;
   $('#channel-list').classList.toggle('can-drag', !!state.account?.admin);
+  // Criar, renomear e apagar canais: só admin (o servidor também barra).
+  $('#channel-list').classList.toggle('can-edit', !!state.account?.admin);
   const view = currentView();
   const groups = [
     ['text', 'Canais de texto'],

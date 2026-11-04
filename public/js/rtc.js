@@ -138,6 +138,7 @@ export class SfuConnection extends EventTarget {
     let disconnectTimer = null;
     pc.addEventListener('connectionstatechange', () => {
       clearTimeout(disconnectTimer);
+      if (this.pc !== pc) return; // conexão antiga, já trocada por outra
       if (pc.connectionState === 'failed') this.fail(codedError('A conexão de mídia caiu', 'connect_failed'));
       else if (pc.connectionState === 'disconnected') {
         disconnectTimer = setTimeout(() => {
@@ -183,6 +184,8 @@ export class SfuConnection extends EventTarget {
         for (const t of transceivers) t.stop();
         // Sem saber se o Cloudflare recebeu a oferta, a sessão pode ter ficado diferente da nossa: recria.
         if (err.code === 'network' || err.code === 'upstream') err.broken = true;
+        // O navegador não conseguiu nem montar a oferta: esta conexão não serve mais, recria.
+        if (!res && !err.code && err instanceof DOMException) Object.assign(err, { code: 'invalid_session_description', broken: true });
         throw err;
       }
       try {
@@ -270,6 +273,16 @@ export class SfuConnection extends EventTarget {
     }
     for (const t of pc.getTransceivers()) {
       if (mids.includes(t.mid)) t.stop();
+    }
+    // Não sobrou nada no ar (saiu da sala de voz, foi mutado…): em vez de negociar uma conexão vazia,
+    // que o Chrome deixa sem BUNDLE e depois recusa a próxima oferta ("max-bundle configured but session
+    // description has no BUNDLE group"), fecha esta e a próxima transmissão abre uma sessão nova.
+    if (pc.getTransceivers().every((t) => t.direction === 'stopped' || t.currentDirection === 'stopped')) {
+      await this.api.closeTracks(this.sessionId, { tracks, force: true }).catch(() => {});
+      this.pc = null;
+      this.sessionId = null;
+      pc.close();
+      return;
     }
     try {
       await pc.setLocalDescription(await pc.createOffer());
