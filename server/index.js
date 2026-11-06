@@ -33,6 +33,8 @@ const USAGE_FILE = path.join(DATA_DIR, 'usage.json');
 const OLD_FILES_DIR = path.join(DATA_DIR, 'files');
 const OLD_FILES_INDEX = path.join(DATA_DIR, 'files.json');
 const SOUNDS_DIR = path.join(DATA_DIR, 'sounds');
+const AVATARS_DIR = path.join(DATA_DIR, 'avatars'); // fotos de perfil, uma por conta
+const AVATAR_MAX_BYTES = 512 * 1024;
 const SOUNDS_INDEX = path.join(DATA_DIR, 'sounds.json');
 const SOUND_MAX_BYTES = 10 * 1024 * 1024;
 const SOUND_MAX_SECONDS = 180;
@@ -232,6 +234,7 @@ function publicParticipant(p) {
     admin: !!p.admin,
     host: !!p.host,
     muted: !!users.get(p.userId)?.muted,
+    avatar: avatarUrl(users.get(p.userId)),
   };
 }
 
@@ -754,7 +757,33 @@ const isAdmin = (user) => isHost(user) || !!user?.admin;
 const userByEmail = (email) => [...users.values()].find((u) => u.email === email);
 
 function publicUser(u) {
-  return { id: u.id, email: u.email, name: u.name, admin: isAdmin(u), host: isHost(u), verified: !!u.verified, muted: !!u.muted, createdAt: u.createdAt };
+  return { id: u.id, email: u.email, name: u.name, admin: isAdmin(u), host: isHost(u), verified: !!u.verified, muted: !!u.muted, avatar: avatarUrl(u), createdAt: u.createdAt };
+}
+
+// A versão no endereço deixa o navegador guardar a foto para sempre e buscar a nova quando ela muda.
+function avatarUrl(u) {
+  return u?.avatar ? `/api/avatars/${u.id}?v=${u.avatar}` : null;
+}
+
+// Só imagens de verdade (pelos primeiros bytes, não pelo que o navegador diz).
+function imageType(buf) {
+  if (buf.length < 12) return null;
+  if (buf[0] === 0x89 && buf.toString('latin1', 1, 4) === 'PNG') return 'image/png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+  if (buf.toString('latin1', 0, 4) === 'GIF8') return 'image/gif';
+  return null;
+}
+
+// A foto mudou: todo mundo que vê a pessoa recebe, e quem conversa com ela no privado também.
+function avatarChanged(user) {
+  for (const p of participants.values()) {
+    if (p.userId !== user.id) continue;
+    send(p.ws, { type: 'account', account: publicUser(user) });
+    broadcast({ type: 'participant:updated', participant: publicParticipant(p) });
+  }
+  const partners = [...channels.values()].filter((c) => c.kind === 'dm' && c.members.includes(user.id)).flatMap((c) => c.members);
+  if (partners.length) refreshFor([...new Set(partners)]);
 }
 
 // Links de uso único (confirmar o e-mail, trocar a senha). Só o hash do token fica guardado na conta.
@@ -1088,6 +1117,7 @@ function publicChannel(c) {
   if (c.kind === 'dm') {
     out.members = c.members;
     out.names = Object.fromEntries(c.members.map((id) => [id, users.get(id)?.name || 'Conta apagada']));
+    out.avatars = Object.fromEntries(c.members.map((id) => [id, avatarUrl(users.get(id))]));
   }
   return out;
 }
@@ -1855,6 +1885,34 @@ authRoutes.post('/reset', async (req, res) => {
   res.json(publicUser(user));
 });
 
+// Foto de perfil: o app já manda quadrada e pequena (256 px).
+authRoutes.post('/avatar', express.raw({ type: () => true, limit: AVATAR_MAX_BYTES }), async (req, res) => {
+  const user = userFrom(req);
+  if (!user) return fail(res, 401, 'unauthorized', 'Entre na sua conta de novo.');
+  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  const type = imageType(body);
+  if (!type) return fail(res, 400, 'image', 'Essa imagem não deu para abrir. Tente uma PNG, JPG ou WebP.');
+  await mkdir(AVATARS_DIR, { recursive: true });
+  await writeFile(path.join(AVATARS_DIR, user.id), body);
+  user.avatar = Date.now();
+  user.avatarType = type;
+  saveUsers();
+  avatarChanged(user);
+  log('INFO', null, `${user.name} trocou a foto de perfil`);
+  res.json(publicUser(user));
+});
+
+authRoutes.delete('/avatar', async (req, res) => {
+  const user = userFrom(req);
+  if (!user) return fail(res, 401, 'unauthorized', 'Entre na sua conta de novo.');
+  await unlink(path.join(AVATARS_DIR, user.id)).catch(() => {});
+  delete user.avatar;
+  delete user.avatarType;
+  saveUsers();
+  avatarChanged(user);
+  res.json(publicUser(user));
+});
+
 authRoutes.post('/logout', (req, res) => {
   logins.delete(readCookie(req, 'sala_login'));
   saveLogins();
@@ -1880,6 +1938,18 @@ authRoutes.post('/password', async (req, res) => {
 });
 
 app.use('/api/auth', authRoutes);
+
+// A foto de alguém: só para quem tem conta aqui.
+app.get('/api/avatars/:id', (req, res) => {
+  if (!userFrom(req)) return res.status(401).end();
+  const user = users.get(req.params.id);
+  if (!user?.avatar) return res.status(404).end();
+  res.sendFile(path.join(AVATARS_DIR, user.id), {
+    headers: { 'Content-Type': user.avatarType || 'image/webp', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=31536000, immutable' },
+  }, (err) => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
+});
 
 const adminRoutes = express.Router();
 
@@ -1924,6 +1994,7 @@ adminRoutes.delete('/users/:id', (req, res) => {
   const locked = protectedAccount(req, user);
   if (locked) return fail(res, 403, 'admin', locked);
   users.delete(user.id);
+  unlink(path.join(AVATARS_DIR, user.id)).catch(() => {});
   saveUsers();
   endLogins(user.id);
   kickUser(user.id, 'Sua conta foi apagada pelo admin.');

@@ -75,6 +75,9 @@
 
   <div id="room" class="room" hidden>
     <div class="ctx-menu" id="ctx-menu" role="menu" hidden></div>
+    <!-- O player do YouTube nunca muda de lugar na página (o iframe recarregaria): ele se posiciona
+         por cima da aba Vídeo ou do quadro dele no palco. -->
+    <div class="yt-wrap off" id="yt-wrap"><div id="yt-player"></div><div class="yt-empty" id="yt-empty">Nenhum vídeo tocando</div><button class="icon-btn sm yt-pin" id="yt-pin" type="button" aria-label="Fixar no palco" title="Fixar no palco, ao lado das telas e das pessoas" data-icon="pin" hidden></button><button class="icon-btn sm yt-full" id="yt-full" type="button" aria-label="Tela cheia" title="Tela cheia (ou dois cliques no vídeo)" data-icon="maximize" hidden></button></div>
     <header class="topbar">
       <button class="icon-btn" id="btn-channels" type="button" aria-label="Canais" title="Canais" data-icon="menu"></button>
       <div class="brand"><img src="/icons/icon.svg" alt="" width="28" height="28"><span>Sala Privada</span></div>
@@ -139,7 +142,7 @@
         </div>
 
         <div class="panel music" data-panel="music">
-          <div class="yt-wrap" id="yt-wrap"><div id="yt-player"></div><div class="yt-empty" id="yt-empty">Nenhum vídeo tocando</div><button class="icon-btn sm yt-full" id="yt-full" type="button" aria-label="Tela cheia" title="Tela cheia (ou dois cliques no vídeo)" data-icon="maximize" hidden></button></div>
+          <div class="yt-slot" id="yt-slot"><div class="yt-away"><span>O vídeo está fixado no palco.</span><button class="btn secondary small" type="button" id="yt-back">Trazer de volta para cá</button></div></div>
           <div class="np">
             <div class="np-title" id="np-title"></div>
             <div class="np-by" id="np-by"></div>
@@ -219,6 +222,15 @@
         <button class="icon-btn" value="close" aria-label="Fechar" data-icon="x"></button>
       </div>
       <div class="dialog-body">
+        <div class="field avatar-field">
+          <div class="avatar lg" id="set-avatar"></div>
+          <div class="avatar-actions">
+            <label class="btn secondary small" for="set-avatar-file"><span data-icon="upload"></span>Trocar foto</label>
+            <input type="file" id="set-avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+            <button class="btn secondary small" type="button" id="set-avatar-remove">Tirar foto</button>
+            <p class="hint" id="set-avatar-hint">Sua foto aparece para todo mundo no lugar das iniciais.</p>
+          </div>
+        </div>
         <div class="field">
           <label for="set-name">Seu nome</label>
           <input id="set-name" class="input" maxlength="32" autocomplete="nickname">

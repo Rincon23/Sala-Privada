@@ -72,6 +72,7 @@ const state = {
   pinned: [], // quadros fixados (p:<pessoa> e s:<tela>), na ordem em que aparecem
   tileOrder: null, // a ordem que a pessoa arrastou no palco (null = a de sempre: telas e depois quem chegou antes)
   dm: false, // vendo as conversas privadas (em vez de um servidor)
+  videoOnStage: false, // o vídeo do YouTube virou um quadro do palco
   dmView: null, // a conversa privada aberta
   tab: 'people',
   unread: 0,
@@ -605,6 +606,7 @@ function enterRoom() {
   setInterval(checkHealth, 3000);
   setInterval(updateSpeaking, 100);
   setInterval(tickConnect, 250);
+  requestAnimationFrame(syncVideoBox);
   const stageObserver = new ResizeObserver(layoutGrid);
   stageObserver.observe($('#grid'));
   stageObserver.observe($('#focus'));
@@ -802,6 +804,7 @@ function leaveVoice({ notify = true } = {}) {
   state.previewing.clear();
   state.pinned = [];
   state.tileOrder = null;
+  state.videoOnStage = false;
   voiceConn.since = 0;
   voiceConn.sent = false;
   $('#connect-panel').hidden = true;
@@ -1607,9 +1610,11 @@ function initials(name = '?') {
   return ((parts[0]?.[0] || '?') + (parts.length > 1 ? parts.at(-1)[0] : '')).toUpperCase();
 }
 
-// As iniciais da pessoa na cor dela.
-function paintAvatar(el, { name, color }) {
+// A foto da pessoa, ou as iniciais na cor dela.
+function paintAvatar(el, { name, color, avatar }) {
   if (color) el.style.setProperty('--c', color);
+  el.classList.toggle('photo', !!avatar);
+  el.style.backgroundImage = avatar ? `url("${avatar}")` : '';
   el.textContent = initials(name);
 }
 
@@ -1872,12 +1877,15 @@ function onPeopleInput(event) {
   applyVolumes();
 }
 
+const VIDEO_KEY = 'v:yt'; // o quadro do vídeo do YouTube no palco
+
 function tileKeys() {
   const keys = [];
   for (const s of screenList()) {
     if (s.mine ? state.previewing.has(s.id) : subs.has(s.id)) keys.push(`s:${s.id}`);
   }
   if (state.voice) for (const p of sortedParticipants()) if (p.voice === state.voice) keys.push(`p:${p.id}`);
+  if (state.voice && state.videoOnStage) keys.unshift(VIDEO_KEY);
   return keys;
 }
 
@@ -1904,6 +1912,11 @@ function renderStage() {
   for (const key of keys) updateTile(key, tiles.get(key) || createTile(key));
 
   const pinned = state.pinned;
+  if (stageDragging) {
+    // Quadro novo no meio do arrasto vai para o fim da grade; o resto fica onde a pessoa arrumou.
+    for (const key of keys) if (!tiles.get(key).el.parentElement) $('#grid').append(tiles.get(key).el);
+    return layoutGrid();
+  }
   placeTiles($('#focus'), pinned);
   placeTiles(
     $('#grid'),
@@ -1929,7 +1942,7 @@ function placeTiles(box, keys) {
 
 function createTile(key) {
   const el = document.createElement('div');
-  el.className = 'tile';
+  el.className = key === VIDEO_KEY ? 'tile video-tile' : 'tile';
   el.dataset.key = key;
   el.innerHTML = `
     <video autoplay playsinline muted></video>
@@ -1950,7 +1963,7 @@ function createTile(key) {
     actionsKey: '',
     iconsKey: '',
   };
-  el.addEventListener('dblclick', () => toggleFullscreen(tile));
+  el.addEventListener('dblclick', () => (key === VIDEO_KEY ? toggleVideoFull() : toggleFullscreen(tile)));
   tile.actions.addEventListener('click', (event) => {
     const button = event.target.closest('button');
     if (button) tileAction(key, button.dataset.act, tile);
@@ -1980,7 +1993,11 @@ function updateTile(key, tile) {
   let icons = '';
   let actions = [state.pinned.includes(key) ? 'unpin' : 'pin', 'fullscreen'];
 
-  if (type === 'p') {
+  if (type === 'v') {
+    const current = state.music?.current;
+    name = current ? `Vídeo · ${current.title}` : 'Vídeo · nada tocando';
+    actions = [...actions, 'close'];
+  } else if (type === 'p') {
     const p = state.participants.get(id);
     const mine = id === state.me.id;
     name = mine ? `${p.name} (você)` : p.name;
@@ -2051,7 +2068,8 @@ function tileAction(key, act, tile) {
     state.pinned = state.pinned.filter((k) => k !== key);
     renderStage();
   } else if (act === 'fullscreen') {
-    toggleFullscreen(tile);
+    if (key === VIDEO_KEY) toggleVideoFull();
+    else toggleFullscreen(tile);
   } else if (act === 'flip') {
     flipCamera();
   } else if (act === 'mute' || act === 'unmute') {
@@ -2060,6 +2078,12 @@ function tileAction(key, act, tile) {
     sub.muted = act === 'mute';
     for (const el of sub.audioEls) el.muted = shouldMute(el);
     renderStage();
+  } else if (act === 'close' && key === VIDEO_KEY) {
+    // O vídeo volta para a aba Vídeo.
+    state.videoOnStage = false;
+    state.pinned = state.pinned.filter((k) => k !== VIDEO_KEY);
+    renderStage();
+    renderMusic();
   } else if (act === 'close') {
     if (local.screens.has(id)) {
       state.previewing.delete(id);
@@ -2077,31 +2101,32 @@ function toggleFullscreen(tile) {
 }
 
 // ---------- arrastar os quadros do palco ----------
+// Como os widgets do celular: enquanto o quadro é arrastado, ele já ocupa o lugar onde vai cair e os
+// outros abrem espaço (com animação). Soltar na área dos fixados fixa o quadro; tirar de lá desafixa.
+// A ordem vale só para quem arrastou.
 
-// Arrastar um quadro muda a ordem só na tela de quem arrastou. Soltar na área dos fixados
-// fixa o quadro naquela posição; soltar na grade (ou na faixa) desafixa.
-let stageDrop = null; // { area: 'focus' | 'grid', before: chave do quadro que fica depois, ou null = no fim }
+let stageDragging = false;
 
 function bindStageDrag() {
   makeDraggable($('#stage'), {
     selector: '.tile',
     canDrag: (el, e) => !e.target.closest('button') && !document.fullscreenElement && tiles.size > 1,
     onMove(el, x, y) {
-      clearStageMarks();
-      stageDrop = stageDropAt(el, x, y);
+      if (!stageDragging) {
+        stageDragging = true;
+        document.body.classList.add('stage-dragging');
+      }
+      liveMoveTile(el, x, y);
     },
-    onDrop(el) {
-      if (stageDrop) moveTile(el.dataset.key, stageDrop);
+    onDrop() {
+      commitStageOrder();
     },
     onEnd() {
-      stageDrop = null;
-      clearStageMarks();
+      stageDragging = false;
+      document.body.classList.remove('stage-dragging');
+      renderStage();
     },
   });
-}
-
-function clearStageMarks() {
-  for (const el of $$('#stage .drop-before, #stage .drop-after, #stage .drop-into')) el.classList.remove('drop-before', 'drop-after', 'drop-into');
 }
 
 function inside(box, x, y) {
@@ -2109,43 +2134,51 @@ function inside(box, x, y) {
   return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
 
-// O quadro embaixo do ponteiro decide: na metade esquerda o arrastado entra antes dele,
-// na direita, depois. Fora de qualquer quadro, entra no fim da área (fixados ou grade).
-function stageDropAt(el, x, y) {
+// O quadro embaixo do ponteiro decide: na metade esquerda o arrastado entra antes dele, na direita,
+// depois. No vão entre quadros nada muda (assim os quadros não ficam pulando).
+function liveMoveTile(el, x, y) {
   const focus = $('#focus');
   const grid = $('#grid');
   const area = !focus.hidden && inside(focus, x, y) ? focus : inside(grid, x, y) ? grid : null;
-  if (!area) return null;
+  if (!area) return;
   const list = [...area.children].filter((t) => t.classList.contains('tile') && t !== el);
   const target = list.find((t) => inside(t, x, y));
-  const name = area === focus ? 'focus' : 'grid';
-  if (!target) {
-    area.classList.add('drop-into');
-    return { area: name, before: null };
+  let before = null;
+  if (target) {
+    const box = target.getBoundingClientRect();
+    before = x > box.left + box.width / 2 ? list[list.indexOf(target) + 1] || null : target;
+  } else if (el.parentElement === area) {
+    return;
   }
-  const box = target.getBoundingClientRect();
-  const after = x > box.left + box.width / 2;
-  target.classList.add(after ? 'drop-after' : 'drop-before');
-  const before = after ? list[list.indexOf(target) + 1]?.dataset.key || null : target.dataset.key;
-  return { area: name, before };
+  if (el.parentElement === area && (el.nextElementSibling === before || before === el)) return;
+  animateTiles(() => {
+    area.insertBefore(el, before);
+    $('#focus').classList.toggle('single', $('#focus').children.length === 1);
+    layoutGrid();
+  });
 }
 
-function moveTile(key, { area, before }) {
-  if (!tiles.has(key)) return;
-  const insertBefore = (list) => {
-    const rest = list.filter((k) => k !== key);
-    const i = before ? rest.indexOf(before) : -1;
-    if (i < 0) rest.push(key);
-    else rest.splice(i, 0, key);
-    return rest;
-  };
-  if (area === 'focus') {
-    state.pinned = insertBefore(state.pinned);
-  } else {
-    state.pinned = state.pinned.filter((k) => k !== key);
-    state.tileOrder = insertBefore(orderedKeys(tileKeys()));
+// FLIP: guarda onde cada quadro estava, muda a ordem e anima cada um do lugar antigo para o novo.
+function animateTiles(change) {
+  const all = [...$$('#stage .tile')];
+  const before = new Map(all.map((t) => [t, t.getBoundingClientRect()]));
+  change();
+  for (const t of all) {
+    const a = before.get(t);
+    const b = t.getBoundingClientRect();
+    const dx = a.left - b.left;
+    const dy = a.top - b.top;
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
+    t.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], { duration: 220, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' });
   }
-  renderStage();
+}
+
+function commitStageOrder() {
+  const keysIn = (box) => [...box.children].map((t) => t.dataset.key).filter((k) => k && tiles.has(k));
+  const pinned = keysIn($('#focus'));
+  const rest = keysIn($('#grid'));
+  state.pinned = pinned;
+  state.tileOrder = [...rest, ...pinned];
 }
 
 // Escolhe o número de colunas que deixa os quadros (16:9) maiores no espaço disponível:
@@ -2153,7 +2186,8 @@ function moveTile(key, { area, before }) {
 function layoutGrid() {
   const grid = $('#grid');
   const focus = $('#focus');
-  const pinned = state.pinned.length;
+  // Conta o que está na tela (no meio de um arrasto, isso muda antes do estado).
+  const pinned = focus.hidden ? 0 : focus.children.length;
   if (pinned) grid.style.removeProperty('--tile-w');
   else fitTiles(grid, grid.children.length);
   if (pinned > 1) fitTiles(focus, pinned);
@@ -2450,7 +2484,7 @@ function bindRail() {
 function dmOther(ch) {
   const id = ch.members?.find((m) => m !== state.account?.id) || ch.members?.[0];
   const online = sortedParticipants().find((p) => p.userId === id);
-  return { userId: id, name: online?.name || ch.names?.[id] || 'Conta apagada', color: online?.color || '', online: !!online };
+  return { userId: id, name: online?.name || ch.names?.[id] || 'Conta apagada', color: online?.color || '', avatar: online?.avatar || ch.avatars?.[id] || null, online: !!online };
 }
 
 function sortedDms() {
@@ -2555,7 +2589,7 @@ function onDirectory(d) {
   renderServersPanel();
 }
 
-const accountOf = (a) => ({ id: a.id, email: a.email, name: a.name, admin: a.admin, host: a.host, muted: !!a.muted });
+const accountOf = (a) => ({ id: a.id, email: a.email, name: a.name, admin: a.admin, host: a.host, muted: !!a.muted, avatar: a.avatar || null });
 
 // O host deu ou tirou o cargo de admin desta conta, ou um admin mutou ou desmutou.
 function onAccount(account, by) {
@@ -2582,6 +2616,7 @@ function onAccount(account, by) {
   }
   renderAll();
   renderSoundpad();
+  if ($('#settings').open) renderSettingsAvatar();
 }
 
 // ---------- canais ----------
@@ -3654,7 +3689,10 @@ function renderMusic() {
       : 'Entre numa sala de voz para ver e colocar vídeos. Cada sala tem os seus.';
   $('#yt-empty').hidden = !!current;
   $('#yt-full').hidden = !current;
+  $('#yt-pin').hidden = !current || !inVoice || state.videoOnStage;
+  $('#yt-slot').classList.toggle('away', state.videoOnStage && inVoice);
   if (!current && isVideoFull()) toggleVideoFull(false);
+  if (state.videoOnStage) renderStage();
   $('#music-url').disabled = !inVoice;
   $('#music-form button').disabled = !inVoice;
   for (const button of [$('#music-toggle'), $('#mini-toggle')]) {
@@ -3695,6 +3733,66 @@ function fmtTime(seconds) {
   const m = Math.floor((s % 3600) / 60);
   const rest = String(s % 60).padStart(2, '0');
   return h ? `${h}:${String(m).padStart(2, '0')}:${rest}` : `${m}:${rest}`;
+}
+
+// ---------- o player flutuante ----------
+// O iframe do YouTube recarregaria se mudasse de lugar na página, então ele fica sempre no mesmo
+// elemento e, a cada quadro, se posiciona por cima do lugar onde deve aparecer: o quadro dele no
+// palco ou a aba Vídeo. Fora dos dois, fica escondido (e tocando). O recorte segue a área que rola.
+
+function videoSlot() {
+  if (state.videoOnStage && !$('#stage').hidden) {
+    const tile = tiles.get(VIDEO_KEY);
+    if (tile) return { el: tile.el, clip: tile.el.parentElement, stage: true };
+  }
+  const slot = $('#yt-slot');
+  const panel = slot.closest('.panel');
+  if (panel.classList.contains('inactive') || slot.classList.contains('away')) return null;
+  return { el: slot, clip: panel, stage: false };
+}
+
+let videoBox = '';
+
+function syncVideoBox() {
+  requestAnimationFrame(syncVideoBox);
+  const wrap = $('#yt-wrap');
+  if (!wrap) return;
+  if (isVideoFull()) {
+    if (videoBox) {
+      videoBox = '';
+      wrap.removeAttribute('style');
+      wrap.classList.remove('off');
+    }
+    return;
+  }
+  const slot = state.inRoom ? videoSlot() : null;
+  const r = slot?.el.getBoundingClientRect();
+  const c = slot?.clip.getBoundingClientRect();
+  const visible = r && c && r.width > 0 && r.height > 0 && r.right > c.left && r.left < c.right && r.bottom > c.top && r.top < c.bottom;
+  if (!visible) {
+    if (videoBox !== 'off') {
+      videoBox = 'off';
+      wrap.classList.add('off');
+      wrap.removeAttribute('style');
+    }
+    return;
+  }
+  const clip = [c.top - r.top, r.right - c.right, r.bottom - c.bottom, c.left - r.left].map((v) => `${Math.max(0, v)}px`).join(' ');
+  const box = `${r.left}|${r.top}|${r.width}|${r.height}|${clip}|${slot.stage}`;
+  if (box === videoBox) return;
+  videoBox = box;
+  wrap.classList.remove('off');
+  wrap.classList.toggle('on-stage', slot.stage);
+  Object.assign(wrap.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px`, clipPath: `inset(${clip})` });
+}
+
+// Fixa o vídeo no palco, junto das telas e das pessoas.
+function pinVideo() {
+  if (!state.voice) return toast('Entre numa sala de voz para colocar o vídeo no palco.');
+  state.videoOnStage = true;
+  if (!state.pinned.includes(VIDEO_KEY)) state.pinned.unshift(VIDEO_KEY);
+  showView(state.voice);
+  renderMusic();
 }
 
 // Tela cheia do vídeo. No iPhone (sem tela cheia para divs) ocupa a tela por CSS.
@@ -4113,8 +4211,64 @@ function bindSoundpad() {
 
 // ---------- configurações ----------
 
+// ---------- foto de perfil ----------
+// O app recorta a imagem no meio, deixa quadrada com 256 px e manda pequena (WebP, ou JPEG no Safari antigo).
+
+function renderSettingsAvatar() {
+  const me = state.participants.get(state.me?.id);
+  paintAvatar($('#set-avatar'), { name: me?.name || state.account?.name || '?', color: me?.color, avatar: state.account?.avatar });
+  $('#set-avatar-remove').hidden = !state.account?.avatar;
+}
+
+async function squareImage(file, size = 256) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const side = Math.min(img.naturalWidth, img.naturalHeight);
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    canvas.getContext('2d').drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side, 0, 0, size, size);
+    const blob = (await new Promise((r) => canvas.toBlob(r, 'image/webp', 0.85))) || (await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.88)));
+    // Navegador que "faz" WebP devolvendo PNG: manda JPEG, que é menor.
+    if (blob && blob.type === 'image/png') return await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.88));
+    return blob;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function uploadAvatar(file) {
+  if (!file) return;
+  const hint = $('#set-avatar-hint');
+  hint.textContent = 'Enviando…';
+  try {
+    const blob = await squareImage(file).catch(() => null);
+    if (!blob) throw new Error('Essa imagem não deu para abrir. Tente uma PNG, JPG ou WebP.');
+    const res = await fetch('/api/auth/avatar', { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.errorDescription || 'Não deu para trocar a foto agora.');
+    state.account = accountOf(data);
+    hint.textContent = 'Foto trocada.';
+  } catch (err) {
+    hint.textContent = err.message;
+  }
+  renderSettingsAvatar();
+}
+
+async function removeAvatar() {
+  const res = await fetch('/api/auth/avatar', { method: 'DELETE' }).catch(() => null);
+  const data = await res?.json().catch(() => null);
+  if (res?.ok && data) state.account = accountOf(data);
+  $('#set-avatar-hint').textContent = res?.ok ? 'Foto tirada: voltam as iniciais.' : 'Não deu para tirar a foto agora.';
+  renderSettingsAvatar();
+}
+
 async function openSettings() {
   $('#set-name').value = state.participants.get(state.me.id)?.name || '';
+  $('#set-avatar-hint').textContent = 'Sua foto aparece para todo mundo no lugar das iniciais.';
+  renderSettingsAvatar();
   const role = state.account?.host ? ' (host)' : state.account?.admin ? ' (admin)' : '';
   $('#set-email').textContent = `Conta: ${state.account?.email || ''}${role}`;
   $('#pw-change').hidden = false;
@@ -4147,6 +4301,11 @@ function fillDevices(select, devices, kind, selected, fallback) {
 }
 
 function bindSettings() {
+  $('#set-avatar-file').addEventListener('change', (e) => {
+    uploadAvatar(e.target.files[0]);
+    e.target.value = '';
+  });
+  $('#set-avatar-remove').addEventListener('click', removeAvatar);
   $('#set-name').addEventListener('change', (e) => {
     const name = e.target.value.trim().slice(0, 32);
     if (!name) return;
@@ -4282,6 +4441,12 @@ function bindRoomUi() {
   });
   $('#connect-retry').addEventListener('click', retryConnect);
   $('#yt-full').addEventListener('click', () => toggleVideoFull());
+  $('#yt-pin').addEventListener('click', pinVideo);
+  $('#yt-back').addEventListener('click', () => tileAction(VIDEO_KEY, 'close'));
+  // A roda do mouse em cima do vídeo rola a aba (o player não está dentro dela na página).
+  $('#yt-wrap').addEventListener('wheel', (e) => {
+    if (!$('#yt-wrap').classList.contains('on-stage')) $('#yt-slot').closest('.panel').scrollBy(0, e.deltaY);
+  }, { passive: true });
   $('#yt-wrap').addEventListener('dblclick', () => toggleVideoFull());
   document.addEventListener('fullscreenchange', renderVideoFull);
   $('#progress').addEventListener('click', seekMusic);

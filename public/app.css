@@ -326,15 +326,11 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 .ch-row.drop-before::after { top: -2px; }
 .ch-row.drop-after::after { bottom: -2px; }
 .ch-row.drop-into { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
-/* Quadros do palco: arrastar muda a ordem; a barra mostra de que lado o quadro vai cair. */
+/* Quadros do palco: ao arrastar, os outros abrem espaço na hora (como os widgets do celular). */
 .stage .tile { -webkit-touch-callout: none; user-select: none; }
-.tile.drop-before::before, .tile.drop-after::before {
-  content: ""; position: absolute; top: 6px; bottom: 6px; width: 4px; border-radius: 2px; background: var(--accent); z-index: 4;
-}
-.tile.drop-before::before { left: 2px; }
-.tile.drop-after::before { right: 2px; }
-.focus.drop-into, .grid.drop-into { box-shadow: inset 0 0 0 2px var(--accent); border-radius: var(--radius); }
-.drag-ghost.tile { aspect-ratio: 16 / 9; height: auto; }
+.stage .tile.drag-source { opacity: 0.25; outline: 2px dashed var(--accent); outline-offset: -2px; }
+.drag-ghost.tile { aspect-ratio: 16 / 9; height: auto; transform: scale(1.04); box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55); }
+body.stage-dragging .focus { min-height: 120px; }
 .voice-status {
   display: flex; align-items: center; gap: 8px; padding: 10px 8px 10px 14px; flex: none;
   border-top: 1px solid var(--border); background: var(--panel);
@@ -458,6 +454,12 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
   display: grid; place-items: center; flex: none; user-select: none;
 }
 .avatar.sm { width: 34px; height: 34px; font-size: 13px; }
+.avatar.photo { background-color: var(--panel-3); background-size: cover; background-position: center; color: transparent; }
+.avatar.lg { width: 72px; height: 72px; font-size: 26px; }
+.avatar-field { display: flex; align-items: center; gap: 16px; }
+.avatar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.avatar-actions .hint { flex-basis: 100%; margin: 0; }
+.avatar-actions label.btn { cursor: pointer; }
 .avatar.xs { width: 30px; height: 30px; font-size: 12px; }
 .bad { color: var(--danger); }
 
@@ -500,7 +502,24 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 .person-vol .i { width: 16px; height: 16px; }
 input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
 
-.yt-wrap { position: relative; aspect-ratio: 16 / 9; border-radius: 12px; overflow: hidden; background: #000; }
+.yt-slot { aspect-ratio: 16 / 9; border-radius: 12px; background: #000; display: grid; place-items: center; }
+.yt-away { display: none; justify-items: center; gap: 8px; padding: 12px; text-align: center; color: var(--muted); font-size: 13px; }
+.yt-slot.away { background: var(--panel); }
+.yt-slot.away .yt-away { display: grid; }
+/* O player flutua por cima do lugar dele (a aba Vídeo ou o quadro no palco); fora dos dois, fica escondido e tocando. */
+.yt-wrap { position: fixed; z-index: 4; left: -10000px; top: 0; width: 320px; height: 180px; border-radius: 12px; overflow: hidden; background: #000; }
+.yt-wrap.off { visibility: hidden; pointer-events: none; }
+.yt-wrap.on-stage { border-radius: var(--radius); }
+.yt-wrap.on-stage .yt-full, .yt-wrap.on-stage .yt-pin { display: none; }
+.yt-pin {
+  position: absolute; top: 8px; right: 44px; z-index: 2; background: rgba(0, 0, 0, 0.55); color: #fff;
+  opacity: 0; transition: opacity 0.15s;
+}
+.yt-wrap:hover .yt-pin, .yt-pin:focus-visible { opacity: 1; }
+@media (hover: none) { .yt-pin { opacity: 1; } }
+/* O quadro do vídeo no palco é transparente: o player aparece por baixo e o nome e os botões ficam por cima. */
+.tile.video-tile { z-index: 5; background: transparent; }
+.tile.video-tile video, .tile.video-tile .avatar { display: none; }
 .yt-wrap iframe, .yt-wrap #yt-player { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; pointer-events: none; }
 /* Tela cheia do vídeo: o iframe não recebe cliques (o player segue o servidor), então o botão é nosso. */
 .yt-full {
@@ -509,11 +528,11 @@ input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
 }
 .yt-wrap:hover .yt-full, .yt-full:focus-visible, .yt-wrap.full .yt-full { opacity: 1; }
 @media (hover: none) { .yt-full { opacity: 1; } }
-.yt-wrap:fullscreen { border-radius: 0; aspect-ratio: auto; width: 100%; height: 100%; }
+.yt-wrap:fullscreen { border-radius: 0; width: 100%; height: 100%; visibility: visible; }
 .yt-wrap:fullscreen .yt-full { top: 16px; right: 16px; }
 /* No iPhone não dá para pôr uma div em tela cheia: ocupa a tela por CSS. */
 .yt-wrap.pseudo-full {
-  position: fixed; inset: 0; z-index: 1000; border-radius: 0; aspect-ratio: auto;
+  position: fixed; inset: 0; z-index: 1000; border-radius: 0; width: auto; height: auto; visibility: visible; pointer-events: auto;
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 .yt-wrap.pseudo-full .yt-full { top: calc(12px + env(safe-area-inset-top)); right: calc(12px + env(safe-area-inset-right)); }
