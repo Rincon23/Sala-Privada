@@ -3803,15 +3803,40 @@ function fmtTime(seconds) {
 // elemento e, a cada quadro, se posiciona por cima do lugar onde deve aparecer: o quadro dele no
 // palco ou a aba Vídeo. Fora dos dois, fica escondido (e tocando). O recorte segue a área que rola.
 
+// Onde o player deve aparecer agora. Arrastando o quadro do vídeo, ele segue o fantasma (a cópia
+// que acompanha o cursor). O recorte só existe quando a área rola (a aba Vídeo e a faixa de baixo):
+// sem isso, um quadro animando entre a área dos fixados e a faixa sumia no meio do caminho.
 function videoSlot() {
+  const ghost = $('.drag-ghost.video-tile');
+  if (ghost) return { el: ghost, clip: null, stage: true, floating: true };
   if (state.videoOnStage && !$('#stage').hidden) {
     const tile = tiles.get(VIDEO_KEY);
-    if (tile) return { el: tile.el, clip: tile.el.parentElement, stage: true };
+    if (tile?.el.isConnected) {
+      const box = tile.el.parentElement;
+      const scrolls = box.scrollWidth > box.clientWidth + 1 || box.scrollHeight > box.clientHeight + 1;
+      return { el: tile.el, clip: scrolls ? box : null, stage: true };
+    }
   }
   const slot = $('#yt-slot');
   const panel = slot.closest('.panel');
   if (panel.classList.contains('inactive') || slot.classList.contains('away')) return null;
   return { el: slot, clip: panel, stage: false };
+}
+
+// A caixa do elemento sem a transformação (posição e tamanho do layout), mais a transformação dele.
+// O player copia as duas: anima junto (translate e escala na GPU) sem redimensionar o iframe a cada
+// quadro da animação, que era o que fazia o vídeo engasgar e piscar durante o arrasto.
+function layoutBox(el) {
+  const cs = getComputedStyle(el);
+  const r = el.getBoundingClientRect();
+  const width = parseFloat(cs.width) || r.width;
+  const height = parseFloat(cs.height) || r.height;
+  if (!cs.transform || cs.transform === 'none') return { left: r.left, top: r.top, width, height, transform: 'none', origin: cs.transformOrigin, visual: r };
+  const m = new DOMMatrixReadOnly(cs.transform);
+  const [ox, oy] = cs.transformOrigin.split(' ').map(parseFloat);
+  const left = r.left - m.e - ox * (1 - m.a);
+  const top = r.top - m.f - oy * (1 - m.d);
+  return { left, top, width, height, transform: cs.transform, origin: cs.transformOrigin, visual: r, sx: m.a, sy: m.d };
 }
 
 let videoBox = '';
@@ -3824,36 +3849,52 @@ function syncVideoBox() {
     if (videoBox) {
       videoBox = '';
       wrap.removeAttribute('style');
-      wrap.classList.remove('off');
+      wrap.classList.remove('off', 'floating');
     }
     return;
   }
   const slot = state.inRoom ? videoSlot() : null;
-  const r = slot?.el.getBoundingClientRect();
-  const c = slot?.clip.getBoundingClientRect();
-  const visible = r && c && r.width > 0 && r.height > 0 && r.right > c.left && r.left < c.right && r.bottom > c.top && r.top < c.bottom;
+  const b = slot && layoutBox(slot.el);
+  const r = b?.visual;
+  const c = slot?.clip ? slot.clip.getBoundingClientRect() : { left: 0, top: 0, right: innerWidth, bottom: innerHeight };
+  const visible = r && r.width > 0 && r.height > 0 && r.right > c.left && r.left < c.right && r.bottom > c.top && r.top < c.bottom;
   if (!visible) {
     if (videoBox !== 'off') {
       videoBox = 'off';
       wrap.classList.add('off');
+      wrap.classList.remove('floating');
       wrap.removeAttribute('style');
     }
     return;
   }
-  const clip = [c.top - r.top, r.right - c.right, r.bottom - c.bottom, c.left - r.left].map((v) => `${Math.max(0, v)}px`).join(' ');
-  const box = `${r.left}|${r.top}|${r.width}|${r.height}|${clip}|${slot.stage}`;
+  // O recorte é medido na tela e convertido para a escala do próprio player.
+  const clip = slot.clip
+    ? [(c.top - r.top) / (b.sy || 1), (r.right - c.right) / (b.sx || 1), (r.bottom - c.bottom) / (b.sy || 1), (c.left - r.left) / (b.sx || 1)]
+        .map((v) => `${Math.max(0, v)}px`)
+        .join(' ')
+    : '';
+  const box = `${b.left}|${b.top}|${b.width}|${b.height}|${b.transform}|${b.origin}|${clip}|${slot.stage}|${!!slot.floating}`;
   if (box === videoBox) return;
   videoBox = box;
   wrap.classList.remove('off');
   wrap.classList.toggle('on-stage', slot.stage);
-  Object.assign(wrap.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px`, clipPath: `inset(${clip})` });
+  wrap.classList.toggle('floating', !!slot.floating);
+  Object.assign(wrap.style, {
+    left: `${b.left}px`,
+    top: `${b.top}px`,
+    width: `${b.width}px`,
+    height: `${b.height}px`,
+    transform: b.transform === 'none' ? '' : b.transform,
+    transformOrigin: b.origin,
+    clipPath: clip ? `inset(${clip})` : '',
+  });
 }
 
-// Fixa o vídeo no palco, junto das telas e das pessoas.
-function pinVideo() {
-  if (!state.voice) return toast('Entre numa sala de voz para colocar o vídeo no palco.');
+// Leva o vídeo para o palco, junto das telas e das pessoas. Lá ele é um quadro como os outros:
+// dá para fixar, arrastar, pôr em tela cheia ou mandar de volta para a aba Vídeo.
+function bringVideoToStage() {
+  if (!state.voice) return toast('Entre numa sala de voz para levar o vídeo ao palco.');
   state.videoOnStage = true;
-  if (!state.pinned.includes(VIDEO_KEY)) state.pinned.unshift(VIDEO_KEY);
   showView(state.voice);
   renderMusic();
 }
@@ -4504,7 +4545,7 @@ function bindRoomUi() {
   });
   $('#connect-retry').addEventListener('click', retryConnect);
   $('#yt-full').addEventListener('click', () => toggleVideoFull());
-  $('#yt-pin').addEventListener('click', pinVideo);
+  $('#yt-pin').addEventListener('click', bringVideoToStage);
   $('#yt-back').addEventListener('click', () => tileAction(VIDEO_KEY, 'close'));
   // A roda do mouse em cima do vídeo rola a aba (o player não está dentro dela na página).
   $('#yt-wrap').addEventListener('wheel', (e) => {

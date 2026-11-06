@@ -515,6 +515,7 @@ input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
 /* O player flutua por cima do lugar dele (a aba Vídeo ou o quadro no palco); fora dos dois, fica escondido e tocando. */
 .yt-wrap { position: fixed; z-index: 4; left: -10000px; top: 0; width: 320px; height: 180px; border-radius: 12px; overflow: hidden; background: #000; }
 .yt-wrap.off { visibility: hidden; pointer-events: none; }
+.yt-wrap.floating { z-index: 999; pointer-events: none; }
 .yt-wrap.on-stage { border-radius: var(--radius); }
 .yt-wrap.on-stage .yt-full, .yt-wrap.on-stage .yt-pin { display: none; }
 .yt-pin {
@@ -525,6 +526,7 @@ input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
 @media (hover: none) { .yt-pin { opacity: 1; } }
 /* O quadro do vídeo no palco é transparente: o player aparece por baixo e o nome e os botões ficam por cima. */
 .tile.video-tile { z-index: 5; background: transparent; }
+.drag-ghost.tile.video-tile { z-index: 1000; }
 .tile.video-tile video, .tile.video-tile .avatar { display: none; }
 .yt-wrap iframe, .yt-wrap #yt-player { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; pointer-events: none; }
 /* Tela cheia do vídeo: o iframe não recebe cliques (o player segue o servidor), então o botão é nosso. */
