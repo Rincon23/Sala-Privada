@@ -542,7 +542,7 @@ function onWelcome(msg) {
       detachMeter(previousId);
       attachMeter(state.me.id, local.mic.stream);
     }
-    for (const entry of localEntries()) if (entry.mids.length) announce(entry);
+    for (const entry of localEntries()) if (entry.mids.length && !entry.parked) announce(entry);
   }
   const me = state.participants.get(state.me.id);
   if (me) me.voice = state.voice;
@@ -675,8 +675,8 @@ function tickConnect() {
   const elapsed = performance.now() - voiceConn.since;
   const waiting = !!steps?.some((st) => st.state === 'wait');
   const failed = !!steps?.some((st) => st.state === 'error');
-  // Para os outros: ainda não ouço ou ainda não falo.
-  const connecting = !!steps && elapsed < CONNECT_GIVEUP_MS && steps.some((st) => (st.id === 'talk' || st.id === 'listen') && st.state === 'wait');
+  // Para os outros: ainda não consigo falar (o microfone está ligado, mas não chegou ao ar).
+  const connecting = !!steps && elapsed < CONNECT_GIVEUP_MS && steps.some((st) => st.id === 'talk' && st.state === 'wait');
   setConnecting(connecting);
 
   const panel = $('#connect-panel');
@@ -756,19 +756,24 @@ function joinVoice(id, { show = true } = {}) {
   if (state.channels.get(id)?.kind !== 'voice') return;
   if (state.voice === id) return showView(id);
   if (state.voice) {
-    stopLocalMedia();
+    stopLocalMedia({ keepMic: true });
     stopSounds();
   }
   state.voice = id;
   setMyVoice(id);
-  send({ type: 'voice:join', channelId: id, connecting: !!state.config.realtimeReady });
-  voiceConn.sent = !!state.config.realtimeReady;
+  // Saiu (ou trocou de sala) há menos de VOICE_HOLD_MS: o mesmo microfone volta ao ar na hora.
+  const reuse = !!local.mic?.parked && !state.account?.muted;
+  const connecting = !!state.config.realtimeReady && state.micOn && !state.account?.muted && !reuse;
+  send({ type: 'voice:join', channelId: id, connecting });
+  voiceConn.sent = connecting;
   unlockAudio();
   sound('join');
   if (state.config.realtimeReady) {
     startConnect('Conectando a voz…');
+    if (reuse) unparkMic();
+    else releaseParkedMic();
     receiver?.prewarm();
-    if (state.micOn && !state.account?.muted) sender?.prewarm();
+    if (!local.mic && state.micOn && !state.account?.muted) sender?.prewarm();
     if (state.micOn) startMic();
     if (joinInfo.startCam) {
       joinInfo.startCam = false;
@@ -784,7 +789,7 @@ function joinVoice(id, { show = true } = {}) {
 
 function leaveVoice({ notify = true } = {}) {
   if (!state.voice) return;
-  stopLocalMedia();
+  stopLocalMedia({ keepMic: true });
   state.voice = null;
   setMyVoice(null);
   if (notify) send({ type: 'voice:join', channelId: null });
@@ -804,15 +809,60 @@ function leaveVoice({ notify = true } = {}) {
   renderAll();
 }
 
-function stopLocalMedia() {
+// keepMic: ao sair ou trocar de sala, o microfone fica "estacionado" por VOICE_HOLD_MS em vez de parar.
+function stopLocalMedia({ keepMic = false } = {}) {
   const mic = local.mic;
-  if (mic) {
+  if (mic && !(keepMic && parkMic())) {
     local.mic = null;
     unpublishLocal(mic);
     detachMeter(state.me.id);
   }
   stopCamera();
   for (const id of [...local.screens.keys()]) stopScreen(id);
+}
+
+// ---------- microfone estacionado ----------
+// Sair de uma sala e voltar logo (ou só trocar de sala) não pode custar uma conexão nova:
+// refazer a sessão no Cloudflare e esperar quem ouve assinar de novo levava mais de 10 s.
+// Por VOICE_HOLD_MS a faixa fica capturada, mas desligada (ninguém ouve) e sem anúncio no
+// servidor, e a conexão de envio continua aberta com ela (uma conexão vazia é o que dá o
+// erro do BUNDLE). Voltando a tempo, é só religar e anunciar de novo.
+
+const VOICE_HOLD_MS = 10_000;
+let micHoldTimer = null;
+
+function parkMic() {
+  const mic = local.mic;
+  if (!mic?.live || !mic.mids.length) return false;
+  mic.parked = true;
+  mic.items[0].track.enabled = false;
+  clearTimeout(micHoldTimer);
+  micHoldTimer = setTimeout(releaseParkedMic, VOICE_HOLD_MS);
+  return true;
+}
+
+// Ninguém voltou a tempo: desmonta como antes (o navegador apaga o aviso de microfone em uso).
+function releaseParkedMic() {
+  clearTimeout(micHoldTimer);
+  micHoldTimer = null;
+  const mic = local.mic;
+  if (!mic?.parked) return;
+  local.mic = null;
+  unpublishLocal(mic);
+  detachMeter(state.me.id);
+  renderControls();
+}
+
+function unparkMic() {
+  const mic = local.mic;
+  if (!mic?.parked) return false;
+  clearTimeout(micHoldTimer);
+  micHoldTimer = null;
+  mic.parked = false;
+  mic.items[0].track.enabled = state.micOn;
+  announce(mic);
+  voiceLog('o microfone voltou ao ar sem reconectar');
+  return true;
 }
 
 function leave() {
@@ -848,7 +898,7 @@ async function rebuildSender() {
   for (const entry of localEntries()) {
     try {
       await pushEntry(entry);
-      announce(entry);
+      if (!entry.parked) announce(entry);
     } catch (err) {
       if (!sender.closed) reportError(err, 'send', entry.label.toLowerCase());
     }
@@ -1000,7 +1050,7 @@ function toggleDeafen() {
 
 function applyMic() {
   if (state.micOn && !local.mic && state.voice) startMic();
-  if (local.mic) local.mic.items[0].track.enabled = state.micOn;
+  if (local.mic) local.mic.items[0].track.enabled = state.micOn && !local.mic.parked;
   renderControls();
 }
 
@@ -1208,22 +1258,27 @@ async function subscribe(stream) {
       if (stream.kind === 'screen') state.watching.delete(stream.id);
     } else {
       const attempt = scheduleRetry(stream.id, sub);
-      // A primeira falha costuma ser a transmissão ainda começando; só avisa se insistir.
-      if (attempt >= 3) reportError(err, 'watch', streamLabel(stream));
+      // As primeiras falhas costumam ser a transmissão ainda começando; só avisa se insistir.
+      if (attempt >= 4) reportError(err, 'watch', streamLabel(stream));
     }
   }
   renderStage();
   renderPeople();
 }
 
+// A primeira falha costuma ser a transmissão ainda começando no Cloudflare: tenta de novo logo
+// (antes eram 2 s, 4 s, 6 s… e quem voltava para a sala levava mais de 10 s para ser ouvido).
+const RETRY_DELAYS = [300, 700, 1500, 3000];
+
 function scheduleRetry(id, sub) {
   const attempt = (retries.get(id) || 0) + 1;
   retries.set(id, attempt);
+  const delay = RETRY_DELAYS[attempt - 1] ?? Math.min(2000 * attempt, 30000);
   setTimeout(() => {
     if (subs.get(id) !== sub) return;
     subs.delete(id);
     reconcile();
-  }, Math.min(2000 * attempt, 30000));
+  }, delay);
   return attempt;
 }
 
@@ -2243,6 +2298,7 @@ function onAccount(account, by) {
       // O servidor já parou de mandar o microfone para os outros; aqui ele desliga de vez.
       state.micOn = false;
       const mic = local.mic;
+      clearTimeout(micHoldTimer);
       if (mic) {
         local.mic = null;
         unpublishLocal(mic);
