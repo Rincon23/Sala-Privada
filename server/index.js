@@ -1,13 +1,10 @@
 // Servidor da Sala Privada: entrega o site, faz a sinalização por WebSocket
-// (quem está na sala, o que está no ar, chat, música e arquivos) e repassa as
+// (quem está na sala, o que está no ar, chat e vídeos) e repassa as
 // chamadas para o Cloudflare Realtime. O segredo do app do Realtime nunca sai daqui.
 import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { appendFile, mkdir, readdir, readFile, statfs, truncate, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readdir, readFile, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
-import { Transform } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import express from 'express';
@@ -30,13 +27,11 @@ const MAIL_FROM = (process.env.MAIL_FROM || '').trim();
 const VERIFY_MS = 24 * 3_600_000; // o link de confirmar o e-mail vale 24 h
 const RESET_MS = 3_600_000; // o de trocar a senha, 1 h
 const LIMIT_GB = Number(process.env.MONTHLY_LIMIT_GB) || 900;
-const FILE_TTL_HOURS = Number(process.env.FILE_TTL_HOURS) || 24;
-const FILE_MAX_GB = Number(process.env.FILE_MAX_GB) || 10;
-const FILES_TOTAL_GB = Number(process.env.FILES_TOTAL_GB) || 50;
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const USAGE_FILE = path.join(DATA_DIR, 'usage.json');
-const FILES_DIR = path.join(DATA_DIR, 'files');
-const FILES_INDEX = path.join(DATA_DIR, 'files.json');
+// A antiga aba Arquivos (envios grandes que sumiam em 24 h) saiu do app; o que sobrou dela é apagado no boot.
+const OLD_FILES_DIR = path.join(DATA_DIR, 'files');
+const OLD_FILES_INDEX = path.join(DATA_DIR, 'files.json');
 const SOUNDS_DIR = path.join(DATA_DIR, 'sounds');
 const SOUNDS_INDEX = path.join(DATA_DIR, 'sounds.json');
 const SOUND_MAX_BYTES = 10 * 1024 * 1024;
@@ -72,8 +67,6 @@ const DEFAULT_SOUNDS = [
   ['explosao', 'Explosão', '💥'],
   ['pum', 'Pum', '💨'],
 ].map(([id, name, emoji]) => ({ id, name, emoji, url: `/sounds/${id}.wav`, builtin: true }));
-// O Cloudflare não deixa passar pedidos de mais de 100 MB, então o envio vai em pedaços.
-const CHUNK_BYTES = 32 * 1024 * 1024;
 const GB = 1e9;
 const RTC_BASE = `https://rtc.live.cloudflare.com/v1/apps/${encodeURIComponent(APP_ID)}`;
 const ICE_SERVERS = [{ urls: 'stun:stun.cloudflare.com:3478' }];
@@ -192,13 +185,12 @@ function logRealtimeError(ctx, code, description, status) {
   log('ERRO', who(ctx.p), `ao ${ctx.action}, ${what} [${detail}]`, todo, `${ctx.p?.id}|cf|${code}`);
 }
 
-// ---------- estado da sala (só em memória, exceto uso do mês e arquivos) ----------
+// ---------- estado da sala (só em memória, exceto o que vai para o disco) ----------
 
 const participants = new Map();
 const streams = new Map();
 const sessions = new Map(); // sessionId do Realtime -> id do participante dono
 const stallReports = new Map(); // id da transmissão -> Map(id de quem reclamou -> quando)
-const files = new Map();
 const sounds = new Map();
 const users = new Map(); // id -> { id, email, name, passHash, createdAt }
 const logins = new Map(); // token do cookie de login -> { userId, createdAt }
@@ -234,7 +226,6 @@ function snapshot(p) {
     streams: [...streams.values()],
     ...directoryFor(p),
     usage: usageInfo(),
-    files: [...files.values()].filter((f) => f.complete).map(publicFile),
     sounds: allSounds(),
   };
 }
@@ -554,13 +545,7 @@ async function saveUsage() {
   }
 }
 
-// ---------- arquivos que somem sozinhos ----------
-
-function publicFile(f) {
-  return { id: f.id, name: f.name, size: f.size, ownerId: f.ownerId, ownerName: f.ownerName, createdAt: f.createdAt, expiresAt: f.expiresAt };
-}
-
-const filePath = (id) => path.join(FILES_DIR, id);
+// ---------- nomes de arquivo ----------
 
 function cleanFileName(name) {
   return String(name ?? '')
@@ -569,47 +554,21 @@ function cleanFileName(name) {
     .slice(0, 200);
 }
 
-async function saveFiles() {
+// Apaga de vez o que a antiga aba Arquivos deixou no volume.
+async function purgeOldFiles() {
+  let bytes = 0;
+  let count = 0;
   try {
-    await writeFile(FILES_INDEX, JSON.stringify([...files.values()].filter((f) => f.complete)));
-  } catch (err) {
-    log('ERRO', null, `não consegui salvar a lista de arquivos (${err.message})`, 'confira o espaço em disco do servidor');
-  }
-}
-
-async function loadFiles() {
-  await mkdir(FILES_DIR, { recursive: true });
-  try {
-    for (const f of JSON.parse(await readFile(FILES_INDEX, 'utf8'))) if (f.complete) files.set(f.id, f);
-  } catch {
-    // ainda não há arquivos
-  }
-  // Envios interrompidos por um reinício ficam no disco sem estar na lista: apaga.
-  for (const name of await readdir(FILES_DIR)) {
-    if (!files.has(name)) await unlink(filePath(name)).catch(() => {});
-  }
-  await sweepFiles();
-}
-
-async function removeFile(f) {
-  files.delete(f.id);
-  await unlink(filePath(f.id)).catch(() => {});
-  if (!f.complete) return;
-  broadcast({ type: 'file:removed', id: f.id });
-  await saveFiles();
-}
-
-async function sweepFiles() {
-  const now = Date.now();
-  for (const f of [...files.values()]) {
-    if (f.complete && f.expiresAt <= now) {
-      await removeFile(f);
-      log('INFO', null, `o arquivo "${f.name}" (${fmtBytes(f.size)}) expirou e foi apagado`);
-    } else if (!f.complete && !f.writing && now - f.updatedAt > 30 * 60_000) {
-      await removeFile(f);
-      log('INFO', null, `o envio de "${f.name}" ficou parado por 30 min e foi descartado`);
+    for (const name of await readdir(OLD_FILES_DIR)) {
+      bytes += (await stat(path.join(OLD_FILES_DIR, name)).catch(() => ({ size: 0 }))).size;
+      count++;
     }
+  } catch {
+    return; // nunca houve, ou já foi apagada
   }
+  await rm(OLD_FILES_DIR, { recursive: true, force: true }).catch(() => {});
+  await rm(OLD_FILES_INDEX, { force: true }).catch(() => {});
+  log('INFO', null, `apaguei a antiga pasta de arquivos grandes (${count} arquivo${count === 1 ? '' : 's'}, ${fmtBytes(bytes)} liberados)`);
 }
 
 // ---------- mesa de sons ----------
@@ -1447,8 +1406,6 @@ app.get('/api/config', (req, res) => {
     realtimeReady: !!(APP_ID && APP_SECRET),
     iceServers: ICE_SERVERS,
     version: APP_VERSION,
-    fileMaxGB: FILE_MAX_GB,
-    fileTtlHours: FILE_TTL_HOURS,
     chatFileMaxMB: CHAT_FILE_MAX_MB,
   });
 });
@@ -1879,7 +1836,7 @@ rtc.put('/sessions/:sid/close', ownSession, async (req, res) => {
 
 app.use('/api/rtc', rtc);
 
-// Downloads usam um cookie, porque um link comum não manda cabeçalho de autorização.
+// Anexos e sons usam um cookie, porque um link comum não manda cabeçalho de autorização.
 app.post('/api/auth-cookie', requireParticipant, (req, res) => {
   const p = req.participant;
   res.cookie('sala_auth', `${p.id}:${p.token}`, {
@@ -1889,91 +1846,6 @@ app.post('/api/auth-cookie', requireParticipant, (req, res) => {
     path: '/api',
     maxAge: 7 * 24 * 3600_000,
   });
-  res.json({ ok: true });
-});
-
-const fileRoutes = express.Router();
-
-fileRoutes.post('/', requireParticipant, async (req, res) => {
-  const p = req.participant;
-  const name = cleanFileName(req.body?.name);
-  const size = Number(req.body?.size);
-  if (!name || !Number.isSafeInteger(size) || size <= 0) return badRequest(res);
-  if (size > FILE_MAX_GB * GB) {
-    return res.status(413).json({ errorCode: 'file_too_large', errorDescription: `"${name}" passa do limite de ${FILE_MAX_GB} GB por arquivo.` });
-  }
-  const reserved = [...files.values()].reduce((sum, f) => sum + f.size, 0);
-  let free = Infinity;
-  try {
-    const fs = await statfs(FILES_DIR);
-    free = fs.bavail * fs.bsize;
-  } catch {
-    // sem informação de disco: confia só no limite do .env
-  }
-  if (reserved + size > FILES_TOTAL_GB * GB || size > free - 2 * GB) {
-    log(
-      'AVISO',
-      who(p),
-      `não deu para enviar "${name}" (${fmtBytes(size)}): ${fmtBytes(reserved)} de ${FILES_TOTAL_GB} GB de arquivos em uso e ${fmtBytes(free)} livres no disco`,
-      'esperar arquivos expirarem, apagar algum na aba Arquivos, ou aumentar FILES_TOTAL_GB no .env',
-    );
-    return res.status(507).json({ errorCode: 'storage_full', errorDescription: 'Sem espaço para arquivos no servidor.' });
-  }
-  const now = Date.now();
-  const f = { id: newId(9), name, size, ownerId: p.id, ownerName: p.name, createdAt: now, updatedAt: now, expiresAt: 0, received: 0, complete: false, writing: false };
-  files.set(f.id, f);
-  await writeFile(filePath(f.id), '');
-  res.json({ id: f.id, chunkSize: CHUNK_BYTES });
-});
-
-fileRoutes.put('/:id/chunk', requireParticipant, async (req, res) => {
-  const f = files.get(req.params.id);
-  if (!f || f.complete) return res.status(404).json({ errorCode: 'not_found', errorDescription: 'Esse envio não existe mais.' });
-  if (f.ownerId !== req.participant.id) return res.status(403).json({ errorCode: 'forbidden', errorDescription: 'Esse envio é de outra pessoa.' });
-  const offset = Number(req.query.offset);
-  if (f.writing || offset !== f.received) {
-    return res.status(409).json({ errorCode: 'offset', errorDescription: 'Pedaço fora de ordem.', received: f.received });
-  }
-  f.writing = true;
-  const limit = Math.min(CHUNK_BYTES, f.size - f.received);
-  let written = 0;
-  const counter = new Transform({
-    transform(chunk, encoding, done) {
-      written += chunk.length;
-      done(written > limit ? new Error('pedaço maior que o combinado') : null, chunk);
-    },
-  });
-  try {
-    await truncate(filePath(f.id), f.received);
-    await pipeline(req, counter, createWriteStream(filePath(f.id), { flags: 'a' }));
-    f.received += written;
-    f.updatedAt = Date.now();
-  } catch {
-    await truncate(filePath(f.id), f.received).catch(() => {});
-    return res.status(400).json({ errorCode: 'chunk_failed', errorDescription: 'Um pedaço do arquivo chegou incompleto.', received: f.received });
-  } finally {
-    f.writing = false;
-  }
-  if (f.received === f.size) {
-    f.complete = true;
-    f.expiresAt = Date.now() + FILE_TTL_HOURS * 3600_000;
-    await saveFiles();
-    broadcast({ type: 'file:added', file: publicFile(f) });
-    broadcast({ type: 'notice', text: `${f.ownerName} enviou ${f.name} (${fmtBytes(f.size)}). Fica ${FILE_TTL_HOURS} h na aba Arquivos.` }, req.participant.id);
-    log('INFO', who(req.participant), `enviou o arquivo "${f.name}" (${fmtBytes(f.size)}); some em ${FILE_TTL_HOURS} h`);
-  }
-  res.json({ received: f.received, complete: f.complete });
-});
-
-fileRoutes.delete('/:id', requireParticipant, async (req, res) => {
-  const p = req.participant;
-  const f = files.get(req.params.id);
-  if (!f) return res.json({ ok: true });
-  if (f.ownerId !== p.id && f.ownerName !== p.name) {
-    return res.status(403).json({ errorCode: 'forbidden', errorDescription: 'Só quem enviou pode apagar.' });
-  }
-  await removeFile(f);
-  if (f.complete) log('INFO', who(p), `apagou o arquivo "${f.name}"`);
   res.json({ ok: true });
 });
 
@@ -1989,17 +1861,6 @@ function readCookie(req, name) {
 function cookieParticipant(req) {
   return participantFrom(readCookie(req, 'sala_auth'));
 }
-
-fileRoutes.get('/:id', (req, res) => {
-  if (!cookieParticipant(req)) {
-    return res.status(401).type('text/plain; charset=utf-8').send('Entre na sala para baixar este arquivo.');
-  }
-  const f = files.get(req.params.id);
-  if (!f?.complete) return res.status(404).type('text/plain; charset=utf-8').send('Esse arquivo já expirou ou foi apagado.');
-  res.download(filePath(f.id), f.name, { headers: { 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' } });
-});
-
-app.use('/api/files', fileRoutes);
 
 const soundRoutes = express.Router();
 
@@ -2179,14 +2040,13 @@ wss.on('connection', (ws, req) => {
 });
 
 await loadUsage();
-await loadFiles();
+await purgeOldFiles();
 await loadSounds();
 await loadUsers();
 await loadServers();
 await loadChannels();
 
 setInterval(saveUsage, 30_000);
-setInterval(sweepFiles, 5 * 60_000);
 setInterval(sweepUploads, 10 * 60_000);
 setInterval(() => {
   if (participants.size) broadcast({ type: 'usage', usage: usageInfo() });
@@ -2211,7 +2071,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 server.listen(PORT, () => {
-  log('INFO', null, `Sala Privada rodando na porta ${PORT}; arquivos somem em ${FILE_TTL_HOURS} h (até ${FILE_MAX_GB} GB cada)`);
+  log('INFO', null, `Sala Privada rodando na porta ${PORT}`);
   if (!APP_ID || !APP_SECRET) {
     log('AVISO', null, 'sem as chaves do Cloudflare Realtime: voz, câmera e telas estão desligados', 'preencha REALTIME_APP_ID e REALTIME_APP_SECRET no .env e rode "docker compose up -d --force-recreate"');
   }

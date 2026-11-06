@@ -11,7 +11,7 @@ Uma sala só para a galera: canais de texto que guardam mensagens e imagens, sal
 - **Site e sinalização:** Node.js num container, publicado pelo Cloudflare Tunnel (sem abrir portas).
 - **Voz, vídeo e telas:** Cloudflare Realtime (SFU). Grátis até 1.000 GB por mês; o app para câmera e telas em 900 GB para nunca passar disso.
 - **Música:** player do YouTube em cada pessoa, sincronizado pelo servidor.
-- **Arquivos:** envio em pedaços de 32 MB (passa do limite de 100 MB do Cloudflare), até 10 GB cada; somem sozinhos depois de 24 h.
+- **Anexos:** imagens e arquivos de até 25 MB, mandados no chat (dá para arrastar para qualquer chat aberto). Não existe mais envio de arquivos grandes.
 - **Mesa de sons:** 11 efeitos gerados por código (`npm run sounds`) e qualquer pessoa pode adicionar os seus, de até 3 minutos (WAV grande demais vira um WAV menor antes de subir). Só um admin tira sons da mesa.
 - **Monitor:** se o áudio ou a câmera de alguém para de chegar, o app refaz a conexão sozinho; se o problema é de quem transmite, o servidor pede para o app dessa pessoa reconectar.
 
@@ -66,10 +66,7 @@ Depois recrie o container: `docker compose up -d --force-recreate`.
 | `MAIL_FROM` | Remetente dos e-mails (padrão `Sala Privada <SMTP_USER>`). |
 | `PUBLIC_URL` | Endereço do site nos links dos e-mails (padrão: o endereço por onde a pessoa entrou). |
 | `MONTHLY_LIMIT_GB` | Quanto do plano grátis pode ser usado antes de pausar câmera e telas (padrão 900). |
-| `FILE_TTL_HOURS` | Depois de quantas horas um arquivo enviado some (padrão 24). |
-| `FILE_MAX_GB` | Tamanho máximo de cada arquivo (padrão 10). |
-| `FILES_TOTAL_GB` | Espaço total para arquivos no servidor (padrão 50). |
-| `CHAT_FILE_MAX_MB` | Tamanho máximo de cada imagem ou arquivo mandado no chat (padrão 25). Esses não expiram. |
+| `CHAT_FILE_MAX_MB` | Tamanho máximo de cada imagem ou arquivo mandado no chat (padrão 25). |
 
 ### O que fica guardado
 

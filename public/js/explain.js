@@ -110,7 +110,7 @@ export function explain(err, what, label = '') {
     case 'file_too_large':
       return { code, text: err.message, action: 'Compacte ou divida o arquivo.' };
     case 'storage_full':
-      return { code, text: 'O servidor está sem espaço para arquivos agora.', action: 'Espere arquivos antigos expirarem ou apague algum da lista.' };
+      return { code, text: 'O servidor está sem espaço agora.', action: 'Tente de novo mais tarde ou avise o host.' };
     default:
       return {
         code,

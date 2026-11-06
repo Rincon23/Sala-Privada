@@ -59,7 +59,6 @@ const state = {
   server: store.get('server', null), // servidor aberto na lista de canais
   channels: new Map(),
   musics: new Map(), // id da sala de voz -> música dela
-  files: new Map(),
   sounds: [],
   music: null, // a música da sala de voz em que estou
   usage: null,
@@ -489,12 +488,6 @@ function onMessage(msg) {
       return onUsage(msg.usage);
     case 'republish':
       return onRepublishRequest();
-    case 'file:added':
-      state.files.set(msg.file.id, msg.file);
-      return renderFiles();
-    case 'file:removed':
-      state.files.delete(msg.id);
-      return renderFiles();
     case 'sound:play': {
       const sound = state.sounds.find((s) => s.id === msg.id);
       return sound && playSound(sound, msg.by);
@@ -530,7 +523,6 @@ function onWelcome(msg) {
   if (invite) send({ type: 'server:join', code: invite });
   state.channels = new Map(msg.state.channels.map((c) => [c.id, c]));
   state.musics = new Map(Object.entries(msg.state.musics));
-  state.files = new Map(msg.state.files.map((f) => [f.id, f]));
   state.sounds = msg.state.sounds;
   // As imagens do chat precisam desse cookie; o histórico só é pedido depois dele.
   authReady = refreshAuthCookie();
@@ -553,7 +545,6 @@ function onWelcome(msg) {
   if (me) me.voice = state.voice;
   onUsage(msg.state.usage);
   syncMusic();
-  renderFiles();
   renderSoundpad();
   renderAll();
   reconcile();
@@ -606,8 +597,6 @@ function enterRoom() {
   setInterval(reportUsage, 15000);
   setInterval(checkHealth, 3000);
   setInterval(updateSpeaking, 100);
-  setInterval(renderFiles, 60000);
-  $('#files-hint').textContent = `Clique ou arraste aqui. Até ${state.config.fileMaxGB} GB cada; somem em ${state.config.fileTtlHours} h.`;
   new ResizeObserver(layoutGrid).observe($('#grid'));
 
   // Entra na sala sem estar em nenhuma sala de voz; o microfone liga ao clicar numa.
@@ -3074,15 +3063,13 @@ function seekMusic(event) {
   send({ type: 'music:seek', t: ((event.clientX - rect.left) / rect.width) * duration });
 }
 
-// ---------- arquivos ----------
-
-const uploads = new Map();
+// ---------- pedidos ao servidor ----------
 
 function authHeader() {
   return `Bearer ${state.me.id}:${state.me.token}`;
 }
 
-// O download é um link comum, então a autorização vai num cookie.
+// Anexos e sons são links comuns, então a autorização vai num cookie.
 function refreshAuthCookie() {
   return fetch('/api/auth-cookie', { method: 'POST', headers: { Authorization: authHeader() } }).catch(() => {});
 }
@@ -3103,164 +3090,18 @@ async function filesApi(method, path, body) {
   return data;
 }
 
-function uploadFiles(list) {
-  if (!list?.length) return;
-  setTab('files');
-  $('#room').classList.remove('side-hidden');
-  for (const file of list) uploadFile(file);
-}
-
-async function uploadFile(file) {
-  const up = { key: randomId(), id: null, name: file.name, size: file.size, sent: 0, xhr: null, cancelled: false, error: '' };
-  uploads.set(up.key, up);
-  renderFiles();
-  try {
-    if (file.size > state.config.fileMaxGB * 1e9) {
-      throw Object.assign(new Error(`"${file.name}" passa do limite de ${state.config.fileMaxGB} GB por arquivo.`), { code: 'file_too_large' });
-    }
-    const { id, chunkSize } = await filesApi('POST', '/api/files', { name: file.name, size: file.size });
-    up.id = id;
-    let offset = 0;
-    while (offset < file.size) {
-      if (up.cancelled) return;
-      offset = await sendChunk(up, file.slice(offset, Math.min(offset + chunkSize, file.size)), offset);
-    }
-    uploads.delete(up.key);
-  } catch (err) {
-    if (up.cancelled) return;
-    up.error = 'Falhou';
-    reportError(err, 'file', `o envio de "${file.name}"`);
-  }
-  renderFiles();
-}
-
-// Manda um pedaço e devolve até onde o servidor já tem. Tenta de novo se a rede piscar.
-function sendChunk(up, blob, offset, attempt = 1) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    up.xhr = xhr;
-    xhr.open('PUT', `/api/files/${up.id}/chunk?offset=${offset}`);
-    xhr.setRequestHeader('Authorization', authHeader());
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    xhr.upload.onprogress = (e) => {
-      up.sent = offset + e.loaded;
-      renderUploadProgress(up);
-    };
-    const retry = (data) => {
-      if (up.cancelled) return resolve(offset);
-      // O pedaço chegou mas a resposta se perdeu: segue de onde o servidor parou.
-      if (Number.isFinite(data?.received) && data.received > offset) return resolve(data.received);
-      if (attempt >= 5) {
-        return reject(Object.assign(new Error(data?.errorDescription || 'A conexão caiu várias vezes durante o envio'), { code: data?.errorCode || 'network' }));
-      }
-      setTimeout(() => sendChunk(up, blob, offset, attempt + 1).then(resolve, reject), 1500 * attempt);
-    };
-    xhr.onload = () => {
-      let data = {};
-      try {
-        data = JSON.parse(xhr.responseText);
-      } catch {
-        // resposta sem corpo
-      }
-      if (xhr.status === 200) return resolve(data.received);
-      if (xhr.status === 401 || xhr.status === 403 || xhr.status === 404 || xhr.status === 413 || xhr.status === 507) {
-        return reject(Object.assign(new Error(data.errorDescription || `Erro ${xhr.status}`), { code: data.errorCode || `http_${xhr.status}` }));
-      }
-      retry(data);
-    };
-    xhr.onerror = () => retry(null);
-    xhr.send(blob);
-  });
-}
-
-function cancelUpload(key) {
-  const up = uploads.get(key);
-  if (!up) return;
-  up.cancelled = true;
-  up.xhr?.abort();
-  uploads.delete(key);
-  if (up.id) filesApi('DELETE', `/api/files/${up.id}`).catch(() => {});
-  renderFiles();
-}
-
-async function deleteFile(id) {
-  try {
-    await filesApi('DELETE', `/api/files/${id}`);
-  } catch (err) {
-    reportError(err, 'file', 'apagar o arquivo');
-  }
-}
-
 function fmtBytes(bytes) {
   if (bytes >= 1e9) return `${(bytes / 1e9).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} GB`;
   if (bytes >= 1e6) return `${Math.round(bytes / 1e6)} MB`;
   return `${Math.max(1, Math.round(bytes / 1e3))} KB`;
 }
 
-function timeLeft(expiresAt) {
-  const minutes = Math.max(0, Math.round((expiresAt - Date.now()) / 60000));
-  if (minutes >= 90) return `some em ${Math.round(minutes / 60)} h`;
-  if (minutes >= 1) return `some em ${minutes} min`;
-  return 'sumindo agora';
-}
-
-function renderUploadProgress(up) {
-  const li = $(`[data-upload="${up.key}"]`);
-  if (!li) return;
-  const pct = up.size ? Math.min(100, (up.sent / up.size) * 100) : 0;
-  $('.file-progress > div', li).style.width = `${pct}%`;
-  $('.file-meta', li).textContent = `Enviando… ${fmtBytes(up.sent)} de ${fmtBytes(up.size)} (${Math.floor(pct)}%)`;
-}
-
-function renderFiles() {
-  if (!state.inRoom) return;
-  const items = [];
-  for (const up of uploads.values()) {
-    const li = document.createElement('li');
-    li.className = 'file uploading';
-    li.dataset.upload = up.key;
-    li.innerHTML = `<span class="file-icon">${icon('upload')}</span><div class="file-main"><div class="file-name"></div><div class="file-meta"></div><div class="file-progress"><div></div></div></div><button class="icon-btn sm" type="button" data-cancel="${up.key}" aria-label="Cancelar envio" title="Cancelar envio">${icon('x')}</button>`;
-    $('.file-name', li).textContent = up.name;
-    if (up.error) {
-      li.classList.add('failed');
-      $('.file-meta', li).textContent = 'O envio falhou. Feche e tente de novo.';
-    }
-    items.push(li);
-  }
-  const myName = state.participants.get(state.me.id)?.name;
-  const sorted = [...state.files.values()].sort((a, b) => b.createdAt - a.createdAt);
-  for (const f of sorted) {
-    const li = document.createElement('li');
-    li.className = 'file';
-    const mine = f.ownerId === state.me.id || f.ownerName === myName;
-    li.innerHTML = `<span class="file-icon">${icon('file')}</span><div class="file-main"><div class="file-name"></div><div class="file-meta"></div></div><a class="icon-btn sm" aria-label="Baixar" title="Baixar">${icon('download')}</a>${mine ? `<button class="icon-btn sm" type="button" data-delete="${f.id}" aria-label="Apagar" title="Apagar">${icon('trash')}</button>` : ''}`;
-    $('.file-name', li).textContent = f.name;
-    $('.file-meta', li).textContent = `${fmtBytes(f.size)} · ${f.ownerName} · ${timeLeft(f.expiresAt)}`;
-    const link = $('a', li);
-    link.href = `/api/files/${encodeURIComponent(f.id)}`;
-    link.download = f.name;
-    items.push(li);
-  }
-  $('#files').replaceChildren(...items);
-  for (const up of uploads.values()) if (!up.error) renderUploadProgress(up);
-  $('#files-empty').hidden = items.length > 0;
-  $('#files-count').textContent = state.files.size || '';
-}
-
-function bindFiles() {
-  $('#file-input').addEventListener('change', (e) => {
-    uploadFiles([...e.target.files]);
-    e.target.value = '';
-  });
-  $('#files').addEventListener('click', (e) => {
-    const cancel = e.target.closest('[data-cancel]');
-    if (cancel) cancelUpload(cancel.dataset.cancel);
-    const del = e.target.closest('[data-delete]');
-    if (del) deleteFile(del.dataset.delete);
-  });
-  // Arrastar arquivos para qualquer lugar da sala.
+// Arrastar arquivos para qualquer lugar da sala: viram anexo do chat que está embaixo
+// (ou do chat aberto na tela, se soltar fora dele).
+function bindDrop() {
   let dragDepth = 0;
   const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+  const chatUnder = (e) => chatViews.find((view) => view.channelId && view.root.contains(e.target)) || activeChatView();
   document.addEventListener('dragenter', (e) => {
     if (!state.inRoom || !hasFiles(e)) return;
     dragDepth++;
@@ -3269,12 +3110,10 @@ function bindFiles() {
   document.addEventListener('dragleave', () => {
     if (dragDepth && --dragDepth === 0) $('#drop-overlay').hidden = true;
   });
-  // Solto em cima de um chat vira anexo da mensagem; em qualquer outro lugar vai para a aba Arquivos.
-  const chatUnder = (e) => chatViews.find((view) => view.channelId && view.root.contains(e.target));
   document.addEventListener('dragover', (e) => {
     if (!state.inRoom || !hasFiles(e)) return;
     e.preventDefault();
-    $('#drop-overlay > div').textContent = chatUnder(e) ? 'Solte para anexar na mensagem' : 'Solte para enviar à aba Arquivos';
+    $('#drop-overlay > div').textContent = chatUnder(e)?.channelId ? 'Solte para anexar na mensagem' : 'Abra um chat para anexar arquivos';
   });
   document.addEventListener('drop', (e) => {
     if (!state.inRoom || !hasFiles(e)) return;
@@ -3282,8 +3121,8 @@ function bindFiles() {
     dragDepth = 0;
     $('#drop-overlay').hidden = true;
     const view = chatUnder(e);
-    if (view) addAttachments(view, [...e.dataTransfer.files]);
-    else uploadFiles([...e.dataTransfer.files]);
+    if (view?.channelId) addAttachments(view, [...e.dataTransfer.files]);
+    else toast('Abra um chat (de texto ou da sala de voz) para anexar arquivos.');
   });
 }
 
@@ -3721,7 +3560,7 @@ function bindRoomUi() {
     if (b) send({ type: 'music:remove', itemId: b.dataset.remove });
   });
   bindSettings();
-  bindFiles();
+  bindDrop();
   bindSoundpad();
 
   document.addEventListener('keydown', (e) => {

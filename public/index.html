@@ -118,7 +118,6 @@
           <button class="tab" data-tab="people" role="tab" type="button"><span data-icon="users"></span>Pessoas <span class="count" id="people-count">0</span></button>
           <button class="tab" data-tab="music" role="tab" type="button"><span data-icon="music"></span>Música</button>
           <button class="tab" data-tab="chat" id="tab-chat" role="tab" type="button" hidden><span data-icon="chat"></span>Chat <span class="badge" id="chat-badge" hidden></span></button>
-          <button class="tab" data-tab="files" role="tab" type="button"><span data-icon="paperclip"></span>Arquivos <span class="count" id="files-count"></span></button>
         </nav>
 
         <div class="panel" data-panel="people">
@@ -151,16 +150,6 @@
           <div class="chat-view" id="voice-chat"></div>
         </div>
 
-        <div class="panel files-panel" data-panel="files">
-          <label class="dropzone" id="dropzone">
-            <input type="file" id="file-input" multiple hidden>
-            <span data-icon="upload"></span>
-            <strong>Enviar arquivos</strong>
-            <span class="dropzone-hint" id="files-hint">Clique ou arraste aqui.</span>
-          </label>
-          <ul class="files" id="files"></ul>
-          <p class="hint" id="files-empty">Nenhum arquivo na sala.</p>
-        </div>
       </aside>
     </main>
 
@@ -204,7 +193,7 @@
     </form>
   </section>
 
-  <div class="drop-overlay" id="drop-overlay" hidden><div>Solte para enviar à sala</div></div>
+  <div class="drop-overlay" id="drop-overlay" hidden><div>Solte para anexar na mensagem</div></div>
   <div class="banner" id="banner" hidden>Conexão perdida. Reconectando…</div>
   <div class="toasts" id="toasts" aria-live="polite"></div>
   <div id="audio-sink" hidden></div>
