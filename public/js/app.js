@@ -1,7 +1,7 @@
 import { makeDraggable } from './drag.js';
 import { explain } from './explain.js';
 import { icon } from './icons.js';
-import { MusicPlayer } from './music.js';
+import { MusicPlayer, playlistVideos } from './music.js';
 import { RtcApi, SfuConnection } from './rtc.js';
 import { compactWav } from './wav.js';
 
@@ -3103,6 +3103,39 @@ function renderVideoFull() {
   button.setAttribute('aria-label', full ? 'Sair da tela cheia' : 'Tela cheia');
 }
 
+// Link com list=: é uma playlist (com ou sem um vídeo dela junto).
+function youtubeList(text) {
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^(www|m|music)\./, '');
+  if (!['youtube.com', 'youtu.be', 'youtube-nocookie.com'].includes(host)) return null;
+  const list = url.searchParams.get('list');
+  if (!list || !/^[\w-]{2,64}$/.test(list)) return null;
+  const v = host === 'youtu.be' ? url.pathname.split('/')[1] : url.searchParams.get('v');
+  return { list, start: /^[\w-]{11}$/.test(v || '') ? v : null };
+}
+
+let addingPlaylist = false;
+
+async function addPlaylist({ list, start }) {
+  if (addingPlaylist) return toast('Ainda estou abrindo a outra playlist.');
+  addingPlaylist = true;
+  const input = $('#music-url');
+  const placeholder = input.placeholder;
+  input.placeholder = 'Abrindo a playlist…';
+  try {
+    const ids = await playlistVideos(list).catch(() => []);
+    send({ type: 'music:addList', list, start, ids });
+  } finally {
+    addingPlaylist = false;
+    input.placeholder = placeholder;
+  }
+}
+
 function toggleMusic() {
   if (!state.music?.current) return;
   send({ type: state.music.playing ? 'music:pause' : 'music:play' });
@@ -3598,8 +3631,10 @@ function bindRoomUi() {
     const input = $('#music-url');
     const url = input.value.trim();
     if (!url) return;
-    send({ type: 'music:add', url });
     input.value = '';
+    const list = youtubeList(url);
+    if (list) addPlaylist(list);
+    else send({ type: 'music:add', url });
   });
   $('#music-toggle').addEventListener('click', toggleMusic);
   $('#mini-toggle').addEventListener('click', toggleMusic);

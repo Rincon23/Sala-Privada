@@ -19,6 +19,52 @@ function loadYouTubeApi() {
   return apiReady;
 }
 
+// Lista os vídeos de uma playlist com um player escondido (sem chave de API).
+// Funciona para playlists comuns e Mix; devolve [] quando o YouTube não lista (o servidor tenta pela página).
+export async function playlistVideos(listId, timeoutMs = 12_000) {
+  const YT = await loadYouTubeApi();
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;left:-10000px;top:0;width:320px;height:180px;visibility:hidden;pointer-events:none';
+  const mount = document.createElement('div');
+  box.append(mount);
+  document.body.append(box);
+  let player = null;
+  let poll = null;
+  try {
+    return await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve([]), timeoutMs);
+      const done = (ids) => {
+        clearTimeout(timer);
+        resolve(ids);
+      };
+      player = new YT.Player(mount, {
+        width: 320,
+        height: 180,
+        playerVars: { listType: 'playlist', list: listId, autoplay: 0, controls: 0, origin: location.origin },
+        events: {
+          onReady: () => {
+            let tries = 0;
+            poll = setInterval(() => {
+              const ids = player.getPlaylist?.() || [];
+              if (ids.length) done(ids);
+              else if (++tries > 24) done([]); // ~6 s sem lista: o YouTube não vai listar
+            }, 250);
+          },
+          onError: () => done([]),
+        },
+      });
+    });
+  } finally {
+    clearInterval(poll);
+    try {
+      player?.destroy();
+    } catch {
+      // já foi
+    }
+    box.remove();
+  }
+}
+
 function readVolume() {
   try {
     const saved = Number(localStorage.getItem('sala:musicVolume'));

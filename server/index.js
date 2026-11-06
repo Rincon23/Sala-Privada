@@ -75,6 +75,8 @@ const RECONNECT_GRACE_MS = 15_000;
 const EMPTY_ROOM_MS = 10_000;
 // Depois de reiniciar, os apps voltam sozinhos para as salas; só então as que ficaram vazias zeram.
 const BOOT_WIPE_MS = 60_000;
+const QUEUE_MAX = 300; // vídeos na fila de cada sala
+const PLAYLIST_MAX = 300; // vídeos lidos de uma playlist
 const STREAM_KINDS = new Set(['mic', 'camera', 'screen']);
 const COLORS = ['#7c6cff', '#ff6b9a', '#34d399', '#f5a524', '#38bdf8', '#fb7185', '#c084fc', '#2dd4bf', '#f97316'];
 
@@ -205,6 +207,7 @@ const attachments = new Map(); // id do anexo -> dados, só dos que já estão n
 const pendingUploads = new Map(); // anexos enviados que ainda não foram para nenhuma mensagem
 const musics = new Map(); // id da sala de voz -> vídeos dela (o atual e a fila)
 const emptyTimers = new Map(); // id da sala de voz vazia -> quando ela vai zerar
+const recentLists = new Map(); // "sala|playlist" -> quando foi adicionada (evita Enter duplo)
 let usage = { month: monthKey(), bytes: 0 };
 let usageDirty = false;
 
@@ -521,6 +524,91 @@ async function videoInfo(videoId) {
   } catch {
     return {};
   }
+}
+
+const YT_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36',
+  'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+  Cookie: 'CONSENT=YES+1; SOCS=CAI',
+};
+
+// O app tenta ler a playlist pelo player do YouTube (funciona para playlists comuns e Mix).
+// Quando não vem nada (ex.: "Envios" de um canal), o servidor lê a página da playlist.
+async function scrapePlaylist(listId) {
+  try {
+    const res = await fetch(`https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}`, { headers: YT_HEADERS, signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return { ids: [] };
+    const html = await res.text();
+    const ids = [];
+    const seen = new Set();
+    for (const re of [/"contentId":"([\w-]{11})","contentType":"LOCKUP_CONTENT_TYPE_VIDEO"/g, /"playlistVideoRenderer":\{"videoId":"([\w-]{11})"/g]) {
+      for (const match of html.matchAll(re)) {
+        if (seen.has(match[1])) continue;
+        seen.add(match[1]);
+        ids.push(match[1]);
+      }
+      if (ids.length) break;
+    }
+    const title = /<meta property="og:title" content="([^"]*)"/.exec(html)?.[1];
+    return { ids, title: title ? decodeHtml(title) : '' };
+  } catch {
+    return { ids: [] };
+  }
+}
+
+function decodeHtml(text) {
+  return text.replace(/&(amp|quot|#39|lt|gt);/g, (m, e) => ({ amp: '&', quot: '"', '#39': "'", lt: '<', gt: '>' })[e]);
+}
+
+async function playlistTitle(listId) {
+  try {
+    const url = `https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(`https://www.youtube.com/playlist?list=${listId}`)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (res.ok) return (await res.json()).title || '';
+  } catch {
+    // sem nome: vale o padrão
+  }
+  return '';
+}
+
+// Busca os títulos dos vídeos de uma playlist aos poucos (4 por vez) e tira da fila os que
+// não podem tocar (privados ou removidos). A fila é reenviada no máximo uma vez por segundo.
+async function fillTitles(channelId, items) {
+  let timer = null;
+  const flush = () => {
+    timer = null;
+    if (channels.has(channelId) && musics.has(channelId)) broadcastMusic(channelId);
+  };
+  const changed = () => {
+    timer ??= setTimeout(flush, 1000);
+  };
+  let skipped = 0;
+  const queue = [...items];
+  const worker = async () => {
+    for (let item = queue.shift(); item; item = queue.shift()) {
+      const m = musics.get(channelId);
+      if (!m || (m.current !== item && !m.queue.includes(item))) continue; // saiu da fila no meio
+      const info = await videoInfo(item.videoId);
+      delete item.pending;
+      if (info.error) {
+        const i = m.queue.indexOf(item);
+        if (i >= 0) {
+          m.queue.splice(i, 1);
+          skipped++;
+        }
+      } else {
+        item.title = info.title || 'Vídeo do YouTube';
+        item.author = info.author || '';
+      }
+      changed();
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  if (timer) {
+    clearTimeout(timer);
+    flush();
+  }
+  return skipped;
 }
 
 function ytErrorText(code) {
@@ -1349,7 +1437,7 @@ const handlers = {
     if (!channelId) return send(p.ws, { type: 'notice', text: 'Entre numa sala de voz para colocar vídeos.' });
     const videoId = parseYouTubeId(String(msg.url ?? ''));
     if (!videoId) return send(p.ws, { type: 'notice', text: 'Esse link não parece ser do YouTube.' });
-    if (musicOf(channelId).queue.length >= 100) return send(p.ws, { type: 'notice', text: 'A fila está cheia.' });
+    if (musicOf(channelId).queue.length >= QUEUE_MAX) return send(p.ws, { type: 'notice', text: 'A fila está cheia.' });
     const info = await videoInfo(videoId);
     if (info.error) return send(p.ws, { type: 'notice', text: info.error });
     if (!channels.has(channelId)) return; // a sala foi apagada enquanto o YouTube respondia
@@ -1361,6 +1449,58 @@ const handlers = {
     } else {
       playItem(channelId, item);
     }
+  },
+
+  // Link de playlist: o app manda os vídeos que o player do YouTube listou (ou nenhum, e aí o servidor lê a página).
+  async 'music:addList'(p, msg) {
+    const channelId = p.voice;
+    if (!channelId) return send(p.ws, { type: 'notice', text: 'Entre numa sala de voz para colocar vídeos.' });
+    const listId = String(msg.list ?? '');
+    if (!/^[\w-]{2,64}$/.test(listId)) return send(p.ws, { type: 'notice', text: 'Esse link de playlist não parece certo.' });
+    const start = /^[\w-]{11}$/.test(String(msg.start ?? '')) ? msg.start : null;
+    const key = `${channelId}|${listId}`;
+    const now = Date.now();
+    for (const [k, at] of recentLists) if (at < now - 15_000) recentLists.delete(k);
+    if (recentLists.has(key)) return send(p.ws, { type: 'notice', text: 'Essa playlist acabou de ser adicionada.' });
+    recentLists.set(key, now);
+    if (musicOf(channelId).queue.length >= QUEUE_MAX) return send(p.ws, { type: 'notice', text: 'A fila está cheia.' });
+
+    let ids = [...new Set((Array.isArray(msg.ids) ? msg.ids : []).map(String).filter((id) => /^[\w-]{11}$/.test(id)))];
+    let scrapedTitle = '';
+    if (!ids.length) {
+      const scraped = await scrapePlaylist(listId);
+      ids = scraped.ids;
+      scrapedTitle = scraped.title || '';
+    }
+    ids = ids.slice(0, PLAYLIST_MAX);
+    if (!ids.length) {
+      recentLists.delete(key);
+      if (start) return handlers['music:add'](p, { url: start });
+      return send(p.ws, { type: 'notice', text: 'Não consegui abrir essa playlist. Ela é privada ou não existe?' });
+    }
+    // Link de um vídeo dentro da playlist: a playlist inteira entra, começando por ele.
+    const at = start ? ids.indexOf(start) : -1;
+    if (at > 0) ids = [...ids.slice(at), ...ids.slice(0, at)];
+    const name = (await playlistTitle(listId)) || scrapedTitle || (listId.startsWith('RD') ? 'Mix do YouTube' : 'do YouTube');
+    if (!channels.has(channelId)) return; // a sala foi apagada enquanto o YouTube respondia
+
+    const m = musicOf(channelId);
+    const room = QUEUE_MAX - m.queue.length;
+    const take = ids.slice(0, Math.max(0, room));
+    if (!take.length) return send(p.ws, { type: 'notice', text: 'A fila está cheia.' });
+    const items = take.map((videoId) => ({ id: newId(), videoId, title: 'Carregando título…', author: '', by: p.name, pending: true }));
+    if (m.current) {
+      m.queue.push(...items);
+      broadcastMusic(channelId);
+    } else {
+      m.queue.push(...items.slice(1));
+      playItem(channelId, items[0]);
+    }
+    const full = take.length < ids.length ? ` A fila encheu: entraram ${take.length} de ${ids.length}.` : '';
+    broadcastVoice(channelId, { type: 'notice', text: `Playlist ${name}: ${take.length} vídeo${take.length === 1 ? '' : 's'} adicionado${take.length === 1 ? '' : 's'} por ${p.name}.${full}` });
+    log('INFO', who(p), `adicionou a playlist "${name}" (${take.length} de ${ids.length} vídeos) na sala "${channels.get(channelId).name}"`);
+    const skipped = await fillTitles(channelId, items);
+    if (skipped) send(p.ws, { type: 'notice', text: `${skipped} vídeo${skipped === 1 ? '' : 's'} da playlist não pode${skipped === 1 ? '' : 'm'} tocar aqui (privado${skipped === 1 ? '' : 's'} ou removido${skipped === 1 ? '' : 's'}) e saí${skipped === 1 ? 'u' : 'ram'} da fila.` });
   },
 
   'music:play'(p) {
