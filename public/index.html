@@ -74,6 +74,7 @@
   </section>
 
   <div id="room" class="room" hidden>
+    <div class="ctx-menu" id="ctx-menu" role="menu" hidden></div>
     <header class="topbar">
       <button class="icon-btn" id="btn-channels" type="button" aria-label="Canais" title="Canais" data-icon="menu"></button>
       <div class="brand"><img src="/icons/icon.svg" alt="" width="28" height="28"><span>Sala Privada</span></div>
@@ -92,12 +93,15 @@
 
     <main class="main">
       <nav class="channels" id="channels" aria-label="Canais">
+        <div class="rail" id="rail" aria-label="Conversas privadas e servidores"></div>
+        <div class="channels-body">
         <button class="server-head" id="server-head" type="button" aria-haspopup="true" aria-expanded="false"><span class="server-name" id="server-name"></span><span data-icon="chevron"></span></button>
         <div class="server-menu" id="server-menu" hidden></div>
         <div class="channel-list" id="channel-list"></div>
         <div class="voice-status" id="voice-status" hidden>
           <div class="voice-status-main"><strong>Voz conectada</strong><span id="voice-status-name"></span></div>
           <button class="icon-btn sm" id="voice-status-leave" type="button" aria-label="Desconectar da voz" title="Desconectar da voz" data-icon="leave"></button>
+        </div>
         </div>
       </nav>
       <div class="channels-backdrop" id="channels-backdrop"></div>
@@ -114,8 +118,13 @@
       </section>
 
       <section class="text-view" id="text-view">
-        <header class="text-head"><span data-icon="hash"></span><h2 id="text-title"></h2></header>
+        <header class="text-head"><span id="text-icon" data-icon="hash"></span><h2 id="text-title"></h2></header>
         <div class="chat-view" id="text-chat"></div>
+        <div class="dm-empty" id="dm-empty" hidden>
+          <span data-icon="chat"></span>
+          <strong>Nenhuma conversa privada ainda</strong>
+          <p id="dm-empty-text"></p>
+        </div>
       </section>
 
       <aside class="side">

@@ -48,6 +48,10 @@ const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const ATTACH_DIR = path.join(DATA_DIR, 'attachments');
 const CHAT_FILE_MAX_MB = Number(process.env.CHAT_FILE_MAX_MB) || 25;
 const CHANNELS_MAX = 50;
+// Conversas privadas: as mensagens (e anexos) somem depois deste tempo, para não lotar o disco.
+const DM_TTL_DAYS = Number(process.env.DM_TTL_DAYS) || 7;
+// Ícones que o host escolhe para cada servidor (desenhos em public/js/icons.js).
+const SERVER_ICONS = new Set(['gamepad', 'meeting', 'chat', 'tvplay', 'music', 'star', 'heart', 'book', 'code', 'trophy', 'rocket', 'coffee']);
 const HISTORY_PAGE = 50;
 // Anexos que o navegador mostra direto no chat; o resto só baixa (um HTML ou SVG aberto aqui rodaria código no site).
 const INLINE_TYPES = new Set([
@@ -975,12 +979,15 @@ function failed(req) {
 const newInvite = () => randomBytes(6).toString('base64url').replace(/[-_]/g, 'x');
 
 function publicServer(s, p) {
-  const out = { id: s.id, name: s.name, createdAt: s.createdAt, members: s.members };
+  const out = { id: s.id, name: s.name, icon: s.icon || null, createdAt: s.createdAt, members: s.members };
   // O convite fica com quem cuida da sala; a lista de banidos, só com o host.
   if (p?.admin || p?.host) out.invite = s.invite;
   if (p?.host) out.banned = s.banned;
   return out;
 }
+
+// Um ícone que combina com o nome (o host troca depois, se quiser).
+const guessIcon = (name) => (/game|jog/i.test(name) ? 'gamepad' : /reuni|meet/i.test(name) ? 'meeting' : null);
 
 function canSee(p, serverId) {
   const s = servers.get(serverId);
@@ -1004,7 +1011,15 @@ function canManage(actor, user) {
 
 function canSeeChannel(p, channelId) {
   const c = channels.get(channelId);
+  if (c?.kind === 'dm') return c.members.includes(p.userId);
   return !!c && canSee(p, c.serverId);
+}
+
+// Duas contas podem conversar no privado se estão num mesmo servidor (o host fala com todos).
+function canDm(a, b) {
+  if (!a || !b || a.id === b.id) return false;
+  if (isHost(a) || isHost(b)) return true;
+  return [...servers.values()].some((s) => s.members.includes(a.id) && s.members.includes(b.id));
 }
 
 // Os servidores, canais e vídeos que essa pessoa enxerga.
@@ -1013,7 +1028,7 @@ function directoryFor(p) {
   const ids = new Set(visible.map((s) => s.id));
   return {
     servers: visible.map((s) => publicServer(s, p)),
-    channels: [...channels.values()].filter((c) => ids.has(c.serverId)).map(publicChannel),
+    channels: [...channels.values()].filter((c) => ids.has(c.serverId) || (c.kind === 'dm' && c.members.includes(p.userId))).map(publicChannel),
     musics: Object.fromEntries([...musics].filter(([id]) => ids.has(channels.get(id)?.serverId)).map(([id, m]) => [id, musicState(m)])),
   };
 }
@@ -1043,6 +1058,8 @@ async function loadServers() {
     s.members = s.members.filter((id) => users.has(id));
     s.banned = (s.banned || []).filter((id) => users.has(id));
     s.invite ||= newInvite();
+    // Servidores de antes dos ícones ganham um pelo nome (o host troca em Gerenciar servidores).
+    if (!('icon' in s)) s.icon = guessIcon(s.name);
   }
   await saveServers();
 }
@@ -1067,7 +1084,45 @@ function addChannel(serverId, kind, name, createdBy) {
 // uma mensagem por linha). Os anexos ficam em data/attachments e só somem se a mensagem for apagada.
 
 function publicChannel(c) {
-  return { id: c.id, serverId: c.serverId, kind: c.kind, name: c.name, position: c.position, createdAt: c.createdAt, lastTs: messages.get(c.id)?.at(-1)?.ts || 0 };
+  const out = { id: c.id, serverId: c.serverId, kind: c.kind, name: c.name, position: c.position, createdAt: c.createdAt, lastTs: messages.get(c.id)?.at(-1)?.ts || 0 };
+  if (c.kind === 'dm') {
+    out.members = c.members;
+    out.names = Object.fromEntries(c.members.map((id) => [id, users.get(id)?.name || 'Conta apagada']));
+  }
+  return out;
+}
+
+// Manda a lista nova de canais para os aparelhos dessas contas.
+function refreshFor(userIds) {
+  for (const p of participants.values()) if (userIds.includes(p.userId)) send(p.ws, { type: 'directory', ...directoryFor(p) });
+}
+
+// Apaga as mensagens privadas mais velhas que DM_TTL_DAYS (e a conversa, se ficou vazia e parada).
+function sweepDms() {
+  const cutoff = Date.now() - DM_TTL_DAYS * 86_400_000;
+  let removed = 0;
+  for (const c of [...channels.values()]) {
+    if (c.kind !== 'dm') continue;
+    const list = messages.get(c.id) || [];
+    const old = list.filter((m) => m.ts < cutoff);
+    if (old.length) {
+      messages.set(c.id, list.filter((m) => m.ts >= cutoff));
+      for (const m of old) {
+        for (const a of m.attachments || []) attachments.delete(a.id);
+        broadcastChannel(c.id, { type: 'chat:deleted', channelId: c.id, id: m.id });
+      }
+      rewriteMessages(c.id);
+      onDisk('a limpeza das conversas privadas', async () => {
+        for (const m of old) for (const a of m.attachments || []) await unlink(attachPath(a.id)).catch(() => {});
+      });
+      removed += old.length;
+    }
+    if (!messages.get(c.id).length && c.createdAt < cutoff) {
+      deleteChannel(c);
+      refreshFor(c.members);
+    }
+  }
+  if (removed) log('INFO', null, `apaguei ${removed} mensage${removed === 1 ? 'm' : 'ns'} privada${removed === 1 ? '' : 's'} com mais de ${DM_TTL_DAYS} dias`);
 }
 
 const messagesFile = (channelId) => path.join(MESSAGES_DIR, `${channelId}.jsonl`);
@@ -1097,7 +1152,11 @@ async function loadChannels() {
   await mkdir(ATTACH_DIR, { recursive: true });
   try {
     for (const c of JSON.parse(await readFile(CHANNELS_FILE, 'utf8'))) {
-      if (!/^[\w-]{1,32}$/.test(c.id) || (c.kind !== 'text' && c.kind !== 'voice')) continue;
+      if (!/^[\w-]{1,32}$/.test(c.id) || !['text', 'voice', 'dm'].includes(c.kind)) continue;
+      if (c.kind === 'dm') {
+        if (Array.isArray(c.members) && c.members.length === 2) channels.set(c.id, c);
+        continue;
+      }
       // Canais de antes dos servidores ficam no principal; os de um servidor que sumiu, somem.
       if (!c.serverId && servers.has(MAIN_SERVER)) c.serverId = MAIN_SERVER;
       if (!servers.has(c.serverId)) continue;
@@ -1247,7 +1306,7 @@ const handlers = {
     const serverId = String(msg.serverId ?? '');
     if (!name || !canSee(p, serverId)) return;
     if (!p.admin) return send(p.ws, { type: 'notice', text: 'Só um admin cria canais.' });
-    if (channels.size >= CHANNELS_MAX * servers.size) return send(p.ws, { type: 'notice', text: 'Canais demais. Apague algum antes.' });
+    if ([...channels.values()].filter((c) => c.kind !== 'dm').length >= CHANNELS_MAX * servers.size) return send(p.ws, { type: 'notice', text: 'Canais demais. Apague algum antes.' });
     const c = addChannel(serverId, kind, name, p.name);
     saveChannels();
     broadcastChannel(c.id, { type: 'channel:added', channel: publicChannel(c), by: p.id });
@@ -1450,7 +1509,11 @@ const handlers = {
 
   chat(p, msg) {
     const channel = channels.get(String(msg.channelId ?? ''));
-    if (!channel || !canSee(p, channel.serverId)) return;
+    if (!channel || !canSeeChannel(p, channel.id)) return;
+    if (channel.kind === 'dm') {
+      const other = users.get(channel.members.find((id) => id !== p.userId));
+      if (!other) return send(p.ws, { type: 'notice', text: 'Essa conta não existe mais.' });
+    }
     const text = String(msg.text ?? '').trim().slice(0, 2000);
     const author = authorKey(p);
     const list = [];
@@ -1462,6 +1525,24 @@ const handlers = {
     }
     if (!text && !list.length) return;
     addMessage({ id: newId(), channelId: channel.id, pid: p.id, author, name: p.name, color: p.color, text, attachments: list, ts: Date.now() });
+  },
+
+  // Abre (ou cria) a conversa privada com outra conta.
+  'dm:open'(p, msg) {
+    const me = users.get(p.userId);
+    const other = users.get(String(msg.userId ?? ''));
+    if (!canDm(me, other)) return send(p.ws, { type: 'notice', text: 'Só dá para conversar no privado com quem está num servidor com você.' });
+    const pair = [me.id, other.id].sort();
+    let c = [...channels.values()].find((x) => x.kind === 'dm' && x.members[0] === pair[0] && x.members[1] === pair[1]);
+    if (!c) {
+      c = { id: newId(), serverId: null, kind: 'dm', name: '', members: pair, position: 0, createdAt: Date.now(), createdBy: p.name };
+      channels.set(c.id, c);
+      messages.set(c.id, []);
+      saveChannels();
+      refreshFor(pair);
+      log('INFO', who(p), `abriu uma conversa privada com ${other.name}`);
+    }
+    send(p.ws, { type: 'dm:opened', id: c.id });
   },
 
   'chat:delete'(p, msg) {
@@ -1642,6 +1723,7 @@ app.get('/api/config', (req, res) => {
     iceServers: ICE_SERVERS,
     version: APP_VERSION,
     chatFileMaxMB: CHAT_FILE_MAX_MB,
+    dmTtlDays: DM_TTL_DAYS,
   });
 });
 
@@ -1895,7 +1977,7 @@ hostRoutes.post('/', (req, res) => {
   const name = cleanName(req.body?.name);
   if (!name) return fail(res, 400, 'name', 'Escolha um nome para o servidor.');
   if (servers.size >= 20) return fail(res, 400, 'too_many', 'Já são 20 servidores. Apague algum antes.');
-  const s = { id: newId(), name, createdAt: Date.now(), members: [], banned: [], invite: newInvite() };
+  const s = { id: newId(), name, icon: guessIcon(name), createdAt: Date.now(), members: [], banned: [], invite: newInvite() };
   servers.set(s.id, s);
   addChannel(s.id, 'text', 'geral', req.user.name);
   addChannel(s.id, 'voice', 'Geral', req.user.name);
@@ -1912,6 +1994,7 @@ hostRoutes.put('/:id', (req, res) => {
   const name = req.body?.name !== undefined ? cleanName(req.body.name) : s.name;
   if (!name) return fail(res, 400, 'name', 'Escolha um nome para o servidor.');
   s.name = name;
+  if (req.body?.icon !== undefined) s.icon = SERVER_ICONS.has(req.body.icon) ? req.body.icon : null;
   if (Array.isArray(req.body?.members)) {
     s.members = [...new Set(req.body.members.map(String))].filter((id) => users.has(id) && !isHost(users.get(id)));
     // Quem o host coloca de volta deixa de estar banido.
@@ -2293,9 +2376,11 @@ await loadSounds();
 await loadUsers();
 await loadServers();
 await loadChannels();
+sweepDms();
 
 setInterval(saveUsage, 30_000);
 setInterval(sweepSignups, 10 * 60_000);
+setInterval(sweepDms, 60 * 60_000);
 setTimeout(() => {
   for (const c of channels.values()) if (c.kind === 'voice' && !emptyTimers.has(c.id)) wipeRoom(c.id);
 }, BOOT_WIPE_MS);

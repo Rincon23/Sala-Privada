@@ -71,6 +71,8 @@ const state = {
   previewing: new Set(),
   pinned: [], // quadros fixados (p:<pessoa> e s:<tela>), na ordem em que aparecem
   tileOrder: null, // a ordem que a pessoa arrastou no palco (null = a de sempre: telas e depois quem chegou antes)
+  dm: false, // vendo as conversas privadas (em vez de um servidor)
+  dmView: null, // a conversa privada aberta
   tab: 'people',
   unread: 0,
   expanded: null,
@@ -411,6 +413,8 @@ function onMessage(msg) {
       return onAccount(msg.account, msg.by);
     case 'server:joined':
       return onServerJoined(msg);
+    case 'dm:opened':
+      return onDmOpened(msg.id);
     case 'invite:error':
       store.set('invite', null);
       $('#no-servers-error').textContent = msg.text;
@@ -1745,6 +1749,87 @@ function renderPeople() {
   $('#people').replaceChildren(...items);
 }
 
+// ---------- menu do botão direito numa pessoa ----------
+// Na lista de Pessoas, numa sala de voz da lista de canais ou no quadro dela no palco.
+
+let menuPerson = null;
+
+function openPersonMenu(p, x, y, anchor) {
+  closePersonMenu();
+  const mine = p.id === state.me?.id;
+  const menu = $('#ctx-menu');
+  const where = p.voice && state.channels.get(p.voice);
+  const tileKey = `p:${p.id}`;
+  const parts = [`<div class="ctx-head"><div class="avatar"></div><div><strong></strong><span></span></div></div>`];
+  if (!mine) parts.push(`<button class="ctx-item" type="button" data-ctx="dm">${icon('chat')}<span>Mensagem privada</span></button>`);
+  if (tiles.has(tileKey)) {
+    const pinned = state.pinned.includes(tileKey);
+    parts.push(`<button class="ctx-item" type="button" data-ctx="${pinned ? 'unpin' : 'pin'}">${icon(pinned ? 'pin-off' : 'pin')}<span>${pinned ? 'Desafixar do palco' : 'Fixar no palco'}</span></button>`);
+  }
+  if (!mine) parts.push(`<label class="ctx-vol" title="Volume (só para você)">${icon('volume')}<input type="range" min="0" max="100" aria-label="Volume (só para você)"></label>`);
+  const actions = mine ? '' : personActions(p);
+  if (actions) parts.push(`<div class="ctx-sep"></div>${actions}`);
+  if (mine) parts.push(`<button class="ctx-item" type="button" data-ctx="settings">${icon('settings')}<span>Configurações</span></button>`);
+  menu.innerHTML = parts.join('');
+  paintAvatar($('.ctx-head .avatar', menu), p);
+  $('.ctx-head strong', menu).textContent = mine ? `${p.name} (você)` : p.name;
+  $('.ctx-head span', menu).textContent = where ? `Em ${where.name}` : p.online ? 'Fora das salas de voz' : 'Reconectando…';
+  const vol = $('input', menu);
+  if (vol) vol.value = Math.round(volumeFor(p.id) * 100);
+  menu.hidden = false;
+  // Fica inteiro dentro da tela.
+  const box = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, innerWidth - box.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, innerHeight - box.height - 8))}px`;
+  menuPerson = { id: p.id, anchor };
+  anchor?.classList.add('menu-open');
+}
+
+function closePersonMenu() {
+  if (!menuPerson) return;
+  menuPerson.anchor?.classList.remove('menu-open');
+  menuPerson = null;
+  $('#ctx-menu').hidden = true;
+}
+
+function bindPersonMenu() {
+  document.addEventListener('contextmenu', (e) => {
+    if (!state.inRoom) return;
+    const el = e.target.closest('#people .person[data-id], #channel-list .ch-member[data-member], #stage .tile[data-key^="p:"]');
+    if (!el) return closePersonMenu();
+    const id = el.dataset.id || el.dataset.member || el.dataset.key.slice(2);
+    const p = state.participants.get(id);
+    if (!p) return;
+    e.preventDefault();
+    openPersonMenu(p, e.clientX, e.clientY, el);
+  });
+  $('#ctx-menu').addEventListener('click', (e) => {
+    const p = state.participants.get(menuPerson?.id);
+    const ctx = e.target.closest('[data-ctx]')?.dataset.ctx;
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (!p || (!ctx && !act)) return;
+    closePersonMenu();
+    if (ctx === 'dm') openDmWith(p);
+    else if (ctx === 'pin' || ctx === 'unpin') tileAction(`p:${p.id}`, ctx, tiles.get(`p:${p.id}`));
+    else if (ctx === 'settings') $('#btn-settings').click();
+    else if (act) onPersonAction(act, p);
+  });
+  $('#ctx-menu').addEventListener('input', (e) => {
+    const p = state.participants.get(menuPerson?.id);
+    if (!p) return;
+    store.set(`vol:${p.name}`, Number(e.target.value));
+    applyVolumes();
+  });
+  document.addEventListener('pointerdown', (e) => {
+    if (menuPerson && !e.target.closest('#ctx-menu')) closePersonMenu();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closePersonMenu();
+  });
+  window.addEventListener('resize', closePersonMenu);
+  window.addEventListener('blur', closePersonMenu);
+}
+
 function onPersonAction(act, p) {
   const server = currentServer();
   if (act === 'mute') return send({ type: 'member:mute', userId: p.userId, muted: !p.muted });
@@ -2234,6 +2319,7 @@ function currentServer() {
 
 function selectServer(id) {
   if (!state.servers.has(id)) return;
+  state.dm = false;
   state.server = id;
   store.set('server', id);
   toggleServerMenu(false);
@@ -2246,17 +2332,10 @@ function toggleServerMenu(open = $('#server-menu').hidden) {
   if (open) renderServerMenu();
 }
 
+// Os servidores ficam na barra da esquerda; o menu do nome tem só o que se faz com o servidor aberto.
 function renderServerMenu() {
   const current = currentServer();
-  const items = sortedServers().map((s) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'server-item';
-    b.dataset.server = s.id;
-    b.innerHTML = `<span class="server-item-name"></span>${s.id === current?.id ? icon('check') : ''}`;
-    $('.server-item-name', b).textContent = s.name;
-    return b;
-  });
+  const items = [];
   const extra = (act, iconName, text) => {
     const b = document.createElement('button');
     b.type = 'button';
@@ -2270,6 +2349,197 @@ function renderServerMenu() {
   extra('join', 'plus', 'Entrar com um convite');
   if (state.account?.host) extra('servers', 'settings', 'Gerenciar servidores');
   $('#server-menu').replaceChildren(...items);
+}
+
+// ---------- barra de servidores ----------
+// Como no Discord: as conversas privadas em cima, depois um ícone por servidor, e embaixo
+// entrar com um convite (e, para o host, gerenciar os servidores).
+
+const SERVER_ICONS = [
+  ['gamepad', 'Jogos'],
+  ['meeting', 'Reunião'],
+  ['chat', 'Conversa'],
+  ['tvplay', 'Vídeos'],
+  ['music', 'Música'],
+  ['star', 'Estrela'],
+  ['heart', 'Coração'],
+  ['book', 'Estudos'],
+  ['code', 'Código'],
+  ['trophy', 'Troféu'],
+  ['rocket', 'Foguete'],
+  ['coffee', 'Café'],
+];
+
+function serverBadge(s) {
+  return s.icon ? icon(s.icon) : escapeText(initials(s.name));
+}
+
+function escapeText(text) {
+  return String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+}
+
+function serverUnread(s) {
+  return [...state.channels.values()].some((c) => c.serverId === s.id && c.kind === 'text' && isUnread(c));
+}
+
+function unreadDms() {
+  return [...state.channels.values()].filter((c) => c.kind === 'dm' && isUnread(c)).length;
+}
+
+function renderRail() {
+  if (!state.inRoom) return;
+  const current = !state.dm && currentServer();
+  const item = (inner, { active = false, unread = false, title = '' } = {}) => {
+    const div = document.createElement('div');
+    div.className = 'rail-item';
+    div.classList.toggle('active', active);
+    div.classList.toggle('unread', unread && !active);
+    div.innerHTML = inner;
+    if (title) $('button', div).title = title;
+    return div;
+  };
+  const dmCount = unreadDms();
+  const items = [
+    item(`<button class="rail-btn" type="button" data-rail="dm" aria-label="Mensagens privadas">${icon('chat')}</button>${dmCount ? `<span class="rail-badge">${dmCount > 9 ? '9+' : dmCount}</span>` : ''}`, {
+      active: state.dm,
+      unread: dmCount > 0,
+      title: 'Mensagens privadas',
+    }),
+  ];
+  const sep = document.createElement('div');
+  sep.className = 'rail-sep';
+  items.push(sep);
+  for (const s of sortedServers()) {
+    const el = item(`<button class="rail-btn${s.icon ? ' has-icon' : ''}" type="button" data-server="${s.id}"></button>`, {
+      active: s.id === current?.id,
+      unread: serverUnread(s),
+      title: s.name,
+    });
+    $('button', el).innerHTML = serverBadge(s);
+    $('button', el).setAttribute('aria-label', s.name);
+    items.push(el);
+  }
+  items.push(item(`<button class="rail-btn ghost" type="button" data-rail="join" aria-label="Entrar com um convite">${icon('plus')}</button>`, { title: 'Entrar com um convite' }));
+  if (state.account?.host) {
+    items.push(item(`<button class="rail-btn ghost muted" type="button" data-rail="servers" aria-label="Gerenciar servidores">${icon('settings')}</button>`, { title: 'Gerenciar servidores' }));
+  }
+  $('#rail').replaceChildren(...items);
+}
+
+function bindRail() {
+  $('#rail').addEventListener('click', (e) => {
+    const server = e.target.closest('[data-server]');
+    if (server) {
+      selectServer(server.dataset.server);
+      return;
+    }
+    const act = e.target.closest('[data-rail]')?.dataset.rail;
+    if (act === 'dm') openDms();
+    else if (act === 'servers') openServersPanel();
+    else if (act === 'join') {
+      const code = prompt('Cole o link ou o código de convite:');
+      if (code) joinByInvite(code);
+    }
+  });
+}
+
+// ---------- conversas privadas ----------
+// Cada conversa é um canal "dm" que só as duas contas enxergam; as mensagens somem depois de
+// alguns dias (o servidor apaga). Abrir uma conversa com alguém: botão direito na pessoa.
+
+function dmOther(ch) {
+  const id = ch.members?.find((m) => m !== state.account?.id) || ch.members?.[0];
+  const online = sortedParticipants().find((p) => p.userId === id);
+  return { userId: id, name: online?.name || ch.names?.[id] || 'Conta apagada', color: online?.color || '', online: !!online };
+}
+
+function sortedDms() {
+  return [...state.channels.values()].filter((c) => c.kind === 'dm').sort((a, b) => (b.lastTs || b.createdAt) - (a.lastTs || a.createdAt));
+}
+
+let dmPicking = false;
+
+function openDms() {
+  state.dm = true;
+  if (!state.channels.get(state.dmView)) state.dmView = sortedDms()[0]?.id || null;
+  toggleServerMenu(false);
+  renderAll();
+}
+
+function openDmWith(p) {
+  if (!p?.userId || p.userId === state.account?.id) return;
+  closePersonMenu();
+  send({ type: 'dm:open', userId: p.userId });
+}
+
+function onDmOpened(id) {
+  const open = () => {
+    if (!state.channels.has(id)) return false;
+    dmPicking = false;
+    $('#room').classList.remove('channels-open');
+    showView(id);
+    return true;
+  };
+  if (!open()) setTimeout(open, 300);
+}
+
+// Quem dá para chamar no privado: quem está conectado e divide um servidor comigo.
+function dmCandidates() {
+  const seen = new Set();
+  const list = [];
+  for (const s of sortedServers()) {
+    for (const p of serverPeople(s)) {
+      if (p.userId === state.account?.id || seen.has(p.userId)) continue;
+      seen.add(p.userId);
+      list.push(p);
+    }
+  }
+  return list;
+}
+
+function renderDmList() {
+  const box = document.createElement('div');
+  box.className = 'ch-group';
+  box.innerHTML = `<button class="btn secondary small dm-new" type="button" data-dm-new>${icon('plus')}Nova conversa</button>`;
+  if (dmPicking) {
+    const ul = document.createElement('ul');
+    ul.className = 'dm-pick';
+    const people = dmCandidates();
+    if (!people.length) ul.innerHTML = '<p class="hint">Ninguém conectado agora. Dá para abrir uma conversa pelo botão direito em alguém.</p>';
+    for (const p of people) {
+      const li = document.createElement('li');
+      li.innerHTML = `<button type="button" data-dm-user="${p.userId}"><span class="avatar"></span><span></span></button>`;
+      paintAvatar($('.avatar', li), p);
+      $('span:last-child', li).textContent = p.name;
+      ul.append(li);
+    }
+    box.append(ul);
+  }
+  const head = document.createElement('div');
+  head.className = 'ch-head';
+  head.innerHTML = '<span>Mensagens privadas</span>';
+  box.append(head);
+  for (const ch of sortedDms()) {
+    const other = dmOther(ch);
+    const row = document.createElement('div');
+    row.className = 'ch-row dm-row';
+    row.dataset.id = ch.id;
+    row.classList.toggle('active', ch.id === state.dmView);
+    row.classList.toggle('unread', isUnread(ch));
+    row.innerHTML = `<button class="ch" type="button" data-channel="${ch.id}"><span class="avatar"></span><span class="ch-name"></span></button>`;
+    paintAvatar($('.avatar', row), other);
+    $('.ch-name', row).textContent = other.name;
+    box.append(row);
+  }
+  if (!sortedDms().length) {
+    const hint = document.createElement('p');
+    hint.className = 'hint';
+    hint.textContent = 'Nenhuma conversa ainda.';
+    box.append(hint);
+  }
+  $('#channel-list').replaceChildren(box);
+  $('#server-name').textContent = 'Mensagens privadas';
+  $('#server-head').disabled = true;
 }
 
 // Mexeram em servidores ou membros: chega a lista nova do que esta conta enxerga.
@@ -2323,11 +2593,13 @@ function sortedChannels(kind, serverId = currentServer()?.id) {
 }
 
 function channelLabel(ch) {
+  if (ch.kind === 'dm') return `@${dmOther(ch).name}`;
   return ch.kind === 'text' ? `#${ch.name}` : ch.name;
 }
 
 // O canal de texto aberto (ou a sala de voz em que estou, se foi ela que a pessoa abriu), no servidor aberto.
 function currentView() {
+  if (state.dm) return state.channels.get(state.dmView) || null;
   const ch = state.channels.get(state.view);
   if (ch && ch.serverId === currentServer()?.id && (ch.kind === 'text' || ch.id === state.voice)) return ch;
   return sortedChannels('text')[0];
@@ -2336,6 +2608,12 @@ function currentView() {
 function showView(id) {
   const ch = state.channels.get(id);
   if (!ch) return;
+  if (ch.kind === 'dm') {
+    state.dm = true;
+    state.dmView = id;
+    return renderAll();
+  }
+  state.dm = false;
   state.view = id;
   if (ch.serverId !== state.server) {
     state.server = ch.serverId;
@@ -2353,15 +2631,27 @@ function openChannel(id) {
 
 function renderView() {
   const ch = currentView();
+  // Conversas privadas sem nenhuma aberta: a tela de "comece uma conversa".
+  const emptyDm = state.dm && !ch;
+  $('#dm-empty').hidden = !emptyDm;
+  $('#text-chat').hidden = emptyDm;
+  if (emptyDm) {
+    $('#stage').hidden = true;
+    $('#text-view').hidden = false;
+    $('#text-title').textContent = 'Mensagens privadas';
+    $('#text-icon').innerHTML = icon('chat');
+    $('#dm-empty-text').textContent = `Clique com o botão direito em alguém (na lista de Pessoas, numa sala de voz ou no palco) e escolha "Mensagem privada". As mensagens somem depois de ${state.config?.dmTtlDays || 7} dias.`;
+  }
   if (!ch || !textChat) return;
-  state.view = ch.id;
+  if (ch.kind !== 'dm') state.view = ch.id;
   const voiceView = ch.kind === 'voice';
   const wasHidden = $('#stage').hidden;
   $('#stage').hidden = !voiceView;
   $('#text-view').hidden = voiceView;
   if (voiceView && wasHidden) requestAnimationFrame(layoutGrid);
   if (!voiceView) {
-    $('#text-title').textContent = ch.name;
+    $('#text-title').textContent = ch.kind === 'dm' ? dmOther(ch).name : ch.name;
+    $('#text-icon').innerHTML = icon(ch.kind === 'dm' ? 'at' : 'hash');
     if (textChat.channelId !== ch.id) bindChat(textChat, ch.id);
     if (document.visibilityState === 'visible') markRead(ch.id);
   }
@@ -2378,6 +2668,13 @@ function renderView() {
 function renderChannels() {
   // Durante um arrasto a lista fica parada; ela é desenhada de novo ao soltar.
   if (!state.inRoom || channelDrag?.active) return;
+  renderRail();
+  if (state.dm) {
+    renderDmList();
+    renderVoiceStatus();
+    return;
+  }
+  $('#server-head').disabled = false;
   $('#channel-list').classList.toggle('can-drag', !!state.account?.admin);
   // Criar, renomear e apagar canais: só admin (o servidor também barra).
   $('#channel-list').classList.toggle('can-edit', !!state.account?.admin);
@@ -2438,10 +2735,14 @@ function renderChannels() {
   });
   $('#channel-list').replaceChildren(...groups);
   $('#server-name').textContent = currentServer()?.name || '';
+  renderVoiceStatus();
+}
+
+function renderVoiceStatus() {
   const voice = state.channels.get(state.voice);
   $('#voice-status').hidden = !voice;
   if (voice) {
-    const where = voice.serverId !== currentServer()?.id ? ` · ${state.servers.get(voice.serverId)?.name || ''}` : '';
+    const where = state.dm || voice.serverId !== currentServer()?.id ? ` · ${state.servers.get(voice.serverId)?.name || ''}` : '';
     $('#voice-status-name').textContent = `${voice.name}${where}`;
   }
 }
@@ -2460,7 +2761,7 @@ function clearDropMarks() {
 function bindChannelDrag() {
   channelDrag = makeDraggable($('#channel-list'), {
     selector: '.ch-row, .ch-member',
-    canDrag: () => !!state.account?.admin,
+    canDrag: () => !!state.account?.admin && !state.dm,
     onMove(el, x, y) {
       clearDropMarks();
       dropTarget = el.classList.contains('ch-row') ? channelDropAt(el, y) : memberDropAt(el, x, y);
@@ -2519,6 +2820,7 @@ function moveMember(pid, channelId) {
 function onChannelRemoved(id) {
   const ch = state.channels.get(id);
   state.channels.delete(id);
+  if (state.dmView === id) state.dmView = null;
   state.musics.delete(id);
   chats.delete(id);
   for (const view of chatViews) if (view.channelId === id) view.channelId = null;
@@ -2593,7 +2895,10 @@ function onChatMessage(m) {
     for (const view of chatViews) if (view.channelId === m.channelId) appendChat(view, m);
   }
   if (m.pid === state.me?.id || isChatVisible(m.channelId)) markRead(m.channelId);
-  else if (m.channelId === state.voice) {
+  else if (ch?.kind === 'dm') {
+    sound('on');
+    toast(`Mensagem privada de ${m.name}${m.text ? `: ${m.text.slice(0, 80)}` : ''}`, { action: 'Abrir', onAction: () => showView(m.channelId) });
+  } else if (m.channelId === state.voice) {
     state.unread++;
     renderBadge();
   }
@@ -2800,6 +3105,7 @@ function renderChatView(view, { keepScroll = false } = {}) {
     const note = document.createElement('p');
     note.className = 'chat-start';
     if (ch?.kind === 'voice') note.textContent = `Começo do chat de ${channelLabel(ch)}. As mensagens daqui somem quando todo mundo sai da sala.`;
+    else if (ch?.kind === 'dm') note.textContent = `Começo da sua conversa privada com ${dmOther(ch).name}. Só vocês dois veem, e as mensagens somem depois de ${state.config?.dmTtlDays || 7} dias.`;
     else note.textContent = ch ? `Começo de ${channelLabel(ch)}. Mande mensagens, imagens (dá para colar com Ctrl+V) e arquivos: tudo fica guardado aqui.` : '';
     items.push(note);
   }
@@ -2963,6 +3269,12 @@ function bindChannels() {
   $('#channel-list').addEventListener('click', (e) => {
     const open = e.target.closest('[data-channel]');
     if (open) return openChannel(open.dataset.channel);
+    if (e.target.closest('[data-dm-new]')) {
+      dmPicking = !dmPicking;
+      return renderChannels();
+    }
+    const dmUser = e.target.closest('[data-dm-user]');
+    if (dmUser) return send({ type: 'dm:open', userId: dmUser.dataset.dmUser });
     const add = e.target.closest('[data-add]');
     if (add) return openChannelDialog({ kind: add.dataset.add });
     const edit = e.target.closest('[data-edit]');
@@ -3138,6 +3450,13 @@ function renderServersPanel() {
           <button class="btn secondary small" type="button" data-act="new-invite" title="O link antigo para de funcionar">Novo link</button>
         </div>`;
       $('.admin-name', li).textContent = s.name;
+      const pick = document.createElement('div');
+      pick.className = 'icon-pick';
+      pick.innerHTML = [
+        `<button type="button" data-icon-pick="" class="${s.icon ? '' : 'on'}" title="Iniciais do nome">${escapeText(initials(s.name))}</button>`,
+        ...SERVER_ICONS.map(([id, label]) => `<button type="button" data-icon-pick="${id}" class="${s.icon === id ? 'on' : ''}" title="${label}">${icon(id)}</button>`),
+      ].join('');
+      $('.admin-row', li).after(pick);
       const count = s.members.length;
       $('.admin-sub', li).textContent = `${count} ${count === 1 ? 'membro' : 'membros'}${banned.length ? ` · ${banned.length} ${banned.length === 1 ? 'banido' : 'banidos'}` : ''}`;
       $('.invite-input', li).value = inviteLink(s);
@@ -3197,8 +3516,10 @@ function bindServersPanel() {
     });
   });
   $('#servers-list').addEventListener('click', (e) => {
-    const b = e.target.closest('[data-act]');
     const s = state.servers.get(e.target.closest('[data-server]')?.dataset.server);
+    const pick = e.target.closest('[data-icon-pick]');
+    if (pick && s) return serversAction(() => serversApi('PUT', `/${s.id}`, { icon: pick.dataset.iconPick || null }));
+    const b = e.target.closest('[data-act]');
     if (!b || !s) return;
     const act = b.dataset.act;
     if (act === 'copy') copyInvite(s);
@@ -3970,6 +4291,8 @@ function bindRoomUi() {
   });
   bindSettings();
   bindDrop();
+  bindRail();
+  bindPersonMenu();
   bindSoundpad();
 
   document.addEventListener('keydown', (e) => {

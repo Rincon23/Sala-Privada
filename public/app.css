@@ -158,7 +158,7 @@ select.input { cursor: pointer; }
 .topbar-actions { margin-left: auto; display: flex; align-items: center; gap: 4px; flex: none; }
 
 .main {
-  --channels-w: 240px; --side-w: 360px;
+  --channels-w: 312px; --side-w: 360px;
   min-height: 0; display: grid; grid-template-columns: var(--channels-w) minmax(0, 1fr) var(--side-w);
   grid-template-areas: "channels center side";
 }
@@ -168,7 +168,95 @@ select.input { cursor: pointer; }
 
 /* ---------- lista de canais ---------- */
 
-.channels { grid-area: channels; position: relative; min-height: 0; display: flex; flex-direction: column; background: var(--bg-2); border-right: 1px solid var(--border); }
+.channels { grid-area: channels; position: relative; min-height: 0; display: flex; background: var(--bg-2); border-right: 1px solid var(--border); }
+.channels-body { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+
+/* ---------- barra de servidores (como no Discord): conversas privadas em cima, servidores embaixo ---------- */
+.rail {
+  flex: none; width: 72px; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 0;
+  overflow-y: auto; scrollbar-width: none; background: var(--bg); border-right: 1px solid var(--border);
+}
+.rail::-webkit-scrollbar { display: none; }
+.rail-sep { width: 32px; height: 2px; flex: none; border-radius: 1px; background: var(--panel-3); }
+.rail-item { position: relative; flex: none; width: 72px; display: grid; place-items: center; }
+.rail-btn {
+  width: 48px; height: 48px; border: 0; border-radius: 50%; display: grid; place-items: center; cursor: pointer;
+  background: var(--panel-2); color: var(--text); font-weight: 700; font-size: 16px; transition: border-radius 0.15s, background 0.15s, color 0.15s;
+}
+.rail-btn .i { width: 26px; height: 26px; }
+.rail-btn.has-icon { color: var(--accent); }
+.rail-btn:hover, .rail-item.active .rail-btn { border-radius: 16px; background: var(--accent); color: #fff; }
+.rail-btn.ghost { background: var(--panel); color: var(--ok); }
+.rail-btn.ghost:hover { background: var(--ok); color: #fff; }
+.rail-btn.ghost.muted { color: var(--muted); }
+.rail-btn.ghost.muted:hover { background: var(--panel-3); color: var(--text); }
+/* A pílula à esquerda: alta no aberto, média no hover, um pontinho quando tem coisa nova. */
+.rail-item::before {
+  content: ""; position: absolute; left: 0; top: 50%; width: 4px; height: 0; border-radius: 0 4px 4px 0;
+  background: var(--text); transform: translateY(-50%); transition: height 0.15s;
+}
+.rail-item.unread::before { height: 8px; }
+.rail-item:hover::before { height: 20px; }
+.rail-item.active::before { height: 40px; }
+.rail-badge {
+  position: absolute; right: 10px; bottom: -2px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  background: var(--danger); color: #fff; font-size: 11px; font-weight: 700; display: grid; place-items: center;
+  box-shadow: 0 0 0 3px var(--bg); pointer-events: none;
+}
+
+/* ---------- conversas privadas ---------- */
+.dm-row .ch { gap: 10px; height: 42px; }
+.dm-row .avatar { width: 28px; height: 28px; font-size: 11px; flex: none; }
+.dm-new { width: 100%; margin-bottom: 8px; }
+.dm-pick { list-style: none; margin: 0 0 12px; padding: 6px; display: grid; gap: 2px; border-radius: 10px; background: var(--panel); }
+.dm-pick button {
+  width: 100%; display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 8px; border: 0; border-radius: 8px;
+  background: none; color: var(--text); cursor: pointer; font-size: 14px; text-align: left;
+}
+.dm-pick button:hover { background: var(--panel-3); }
+.dm-pick .avatar { width: 22px; height: 22px; font-size: 9px; }
+.dm-pick .hint { padding: 6px 8px; margin: 0; }
+.dm-empty { flex: 1; display: grid; place-content: center; justify-items: center; gap: 8px; padding: 24px; text-align: center; color: var(--muted); }
+.dm-empty .i { width: 40px; height: 40px; color: var(--accent); }
+.dm-empty strong { color: var(--text); font-size: 16px; }
+.dm-empty p { max-width: 380px; margin: 0; font-size: 14px; }
+
+/* ---------- menu do botão direito numa pessoa ---------- */
+.ctx-menu {
+  position: fixed; z-index: 1200; width: 240px; padding: 6px; border-radius: 12px; background: var(--panel-2);
+  border: 1px solid var(--border); box-shadow: var(--shadow); animation: rise 0.1s ease;
+}
+.ctx-head { display: flex; align-items: center; gap: 10px; padding: 6px 8px 8px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+.ctx-head .avatar { width: 32px; height: 32px; font-size: 12px; flex: none; }
+.ctx-head strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx-head span { font-size: 12px; color: var(--muted); }
+.ctx-menu .person-act, .ctx-item {
+  width: 100%; display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 8px; border: 0; border-radius: 8px;
+  background: none; color: var(--text); cursor: pointer; font-size: 14px; text-align: left;
+}
+.ctx-menu .person-act:hover, .ctx-item:hover { background: var(--accent); color: #fff; }
+.ctx-menu .person-act.danger { color: var(--danger); }
+.ctx-menu .person-act.danger:hover { background: var(--danger); color: #fff; }
+.ctx-menu .i { width: 16px; height: 16px; }
+.ctx-vol { display: flex; align-items: center; gap: 10px; padding: 6px 8px; color: var(--muted); }
+.ctx-vol .i { width: 16px; height: 16px; flex: none; }
+.ctx-sep { height: 1px; margin: 4px 2px; background: var(--border); }
+
+/* Passar o mouse acende a pessoa (lista, sala de voz e palco); o botão direito abre o menu. */
+.person, .ch-member { cursor: pointer; transition: background 0.12s; }
+.person:hover { background: var(--panel-2); box-shadow: inset 0 0 0 1px var(--border); }
+.ch-member:hover, .ch-member.menu-open { background: var(--panel-2); color: var(--text); }
+.person.menu-open { background: var(--panel-2); box-shadow: inset 0 0 0 1px var(--accent); }
+.stage .tile:hover, .stage .tile.menu-open { outline: 2px solid var(--panel-3); }
+.stage .tile.menu-open { outline-color: var(--accent); }
+.icon-pick { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.icon-pick button {
+  width: 32px; height: 32px; border: 0; border-radius: 8px; display: grid; place-items: center; cursor: pointer;
+  background: var(--panel); color: var(--muted); font-size: 12px; font-weight: 700;
+}
+.icon-pick button .i { width: 18px; height: 18px; }
+.icon-pick button:hover { color: var(--text); background: var(--panel-3); }
+.icon-pick button.on { background: var(--accent); color: #fff; }
 .server-head {
   display: flex; align-items: center; gap: 8px; height: 48px; padding: 0 12px 0 16px; flex: none;
   border: 0; border-bottom: 1px solid var(--border); background: none; color: var(--text); cursor: pointer; text-align: left;
@@ -645,7 +733,7 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 }
 
 @media (max-width: 1100px) {
-  .main { --channels-w: 210px; --side-w: 300px; }
+  .main { --channels-w: 282px; --side-w: 300px; }
 }
 
 @media (max-width: 820px) {
@@ -657,7 +745,7 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
   .side { border-left: 0; border-top: 1px solid var(--border); }
   #btn-channels { display: grid; margin-left: -6px; }
   .channels {
-    position: fixed; z-index: 36; top: 0; bottom: 0; left: 0; width: min(280px, 85vw);
+    position: fixed; z-index: 36; top: 0; bottom: 0; left: 0; width: min(340px, 90vw);
     padding-top: env(safe-area-inset-top); box-shadow: var(--shadow);
     transform: translateX(-105%); transition: transform 0.2s ease;
   }
