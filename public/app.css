@@ -238,6 +238,15 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 .ch-row.drop-before::after { top: -2px; }
 .ch-row.drop-after::after { bottom: -2px; }
 .ch-row.drop-into { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+/* Quadros do palco: arrastar muda a ordem; a barra mostra de que lado o quadro vai cair. */
+.stage .tile { -webkit-touch-callout: none; user-select: none; }
+.tile.drop-before::before, .tile.drop-after::before {
+  content: ""; position: absolute; top: 6px; bottom: 6px; width: 4px; border-radius: 2px; background: var(--accent); z-index: 4;
+}
+.tile.drop-before::before { left: 2px; }
+.tile.drop-after::before { right: 2px; }
+.focus.drop-into, .grid.drop-into { box-shadow: inset 0 0 0 2px var(--accent); border-radius: var(--radius); }
+.drag-ghost.tile { aspect-ratio: 16 / 9; height: auto; }
 .voice-status {
   display: flex; align-items: center; gap: 8px; padding: 10px 8px 10px 14px; flex: none;
   border-top: 1px solid var(--border); background: var(--panel);

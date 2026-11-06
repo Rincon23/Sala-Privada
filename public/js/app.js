@@ -70,6 +70,7 @@ const state = {
   watching: new Set(),
   previewing: new Set(),
   pinned: [], // quadros fixados (p:<pessoa> e s:<tela>), na ordem em que aparecem
+  tileOrder: null, // a ordem que a pessoa arrastou no palco (null = a de sempre: telas e depois quem chegou antes)
   tab: 'people',
   unread: 0,
   expanded: null,
@@ -602,6 +603,7 @@ function enterRoom() {
   const stageObserver = new ResizeObserver(layoutGrid);
   stageObserver.observe($('#grid'));
   stageObserver.observe($('#focus'));
+  bindStageDrag();
 
   // Entra na sala sem estar em nenhuma sala de voz; o microfone liga ao clicar numa.
   if (!state.config.realtimeReady) {
@@ -658,6 +660,7 @@ function leaveVoice({ notify = true } = {}) {
   state.watching.clear();
   state.previewing.clear();
   state.pinned = [];
+  state.tileOrder = null;
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   toggleSoundpad(false);
   stopSounds(); // os sons eram daquela sala
@@ -1597,9 +1600,17 @@ function tileKeys() {
 
 // Põe os quadros no lugar: os fixados em cima (grandes) e o resto na grade, ou numa faixa
 // de quadros menores quando há algo fixado.
+// Depois que a pessoa arrasta algum quadro, a ordem dela vale; quadros novos entram no fim.
+function orderedKeys(keys) {
+  if (!state.tileOrder) return keys;
+  const known = state.tileOrder.filter((k) => keys.includes(k));
+  state.tileOrder = [...known, ...keys.filter((k) => !known.includes(k))];
+  return state.tileOrder;
+}
+
 function renderStage() {
   if (!state.inRoom) return;
-  const keys = tileKeys();
+  const keys = orderedKeys(tileKeys());
   // Quadro que sumiu (a pessoa saiu, a tela parou) sai dos fixados sozinho.
   state.pinned = state.pinned.filter((k) => keys.includes(k));
   for (const [key, tile] of tiles) {
@@ -1636,6 +1647,7 @@ function placeTiles(box, keys) {
 function createTile(key) {
   const el = document.createElement('div');
   el.className = 'tile';
+  el.dataset.key = key;
   el.innerHTML = `
     <video autoplay playsinline muted></video>
     <div class="avatar"></div>
@@ -1777,6 +1789,78 @@ function toggleFullscreen(tile) {
   if (document.fullscreenElement) return document.exitFullscreen().catch(() => {});
   if (tile.el.requestFullscreen) tile.el.requestFullscreen().catch(() => {});
   else tile.video.webkitEnterFullscreen?.();
+}
+
+// ---------- arrastar os quadros do palco ----------
+
+// Arrastar um quadro muda a ordem só na tela de quem arrastou. Soltar na área dos fixados
+// fixa o quadro naquela posição; soltar na grade (ou na faixa) desafixa.
+let stageDrop = null; // { area: 'focus' | 'grid', before: chave do quadro que fica depois, ou null = no fim }
+
+function bindStageDrag() {
+  makeDraggable($('#stage'), {
+    selector: '.tile',
+    canDrag: (el, e) => !e.target.closest('button') && !document.fullscreenElement && tiles.size > 1,
+    onMove(el, x, y) {
+      clearStageMarks();
+      stageDrop = stageDropAt(el, x, y);
+    },
+    onDrop(el) {
+      if (stageDrop) moveTile(el.dataset.key, stageDrop);
+    },
+    onEnd() {
+      stageDrop = null;
+      clearStageMarks();
+    },
+  });
+}
+
+function clearStageMarks() {
+  for (const el of $$('#stage .drop-before, #stage .drop-after, #stage .drop-into')) el.classList.remove('drop-before', 'drop-after', 'drop-into');
+}
+
+function inside(box, x, y) {
+  const r = box.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
+// O quadro embaixo do ponteiro decide: na metade esquerda o arrastado entra antes dele,
+// na direita, depois. Fora de qualquer quadro, entra no fim da área (fixados ou grade).
+function stageDropAt(el, x, y) {
+  const focus = $('#focus');
+  const grid = $('#grid');
+  const area = !focus.hidden && inside(focus, x, y) ? focus : inside(grid, x, y) ? grid : null;
+  if (!area) return null;
+  const list = [...area.children].filter((t) => t.classList.contains('tile') && t !== el);
+  const target = list.find((t) => inside(t, x, y));
+  const name = area === focus ? 'focus' : 'grid';
+  if (!target) {
+    area.classList.add('drop-into');
+    return { area: name, before: null };
+  }
+  const box = target.getBoundingClientRect();
+  const after = x > box.left + box.width / 2;
+  target.classList.add(after ? 'drop-after' : 'drop-before');
+  const before = after ? list[list.indexOf(target) + 1]?.dataset.key || null : target.dataset.key;
+  return { area: name, before };
+}
+
+function moveTile(key, { area, before }) {
+  if (!tiles.has(key)) return;
+  const insertBefore = (list) => {
+    const rest = list.filter((k) => k !== key);
+    const i = before ? rest.indexOf(before) : -1;
+    if (i < 0) rest.push(key);
+    else rest.splice(i, 0, key);
+    return rest;
+  };
+  if (area === 'focus') {
+    state.pinned = insertBefore(state.pinned);
+  } else {
+    state.pinned = state.pinned.filter((k) => k !== key);
+    state.tileOrder = insertBefore(orderedKeys(tileKeys()));
+  }
+  renderStage();
 }
 
 // Escolhe o número de colunas que deixa os quadros (16:9) maiores no espaço disponível:

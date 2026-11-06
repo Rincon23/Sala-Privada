@@ -7,7 +7,7 @@ const HOLD_MS = 350;
 const EDGE_PX = 40; // perto da borda da lista, ela rola sozinha
 
 // root: onde ficam os itens (e que rola). selector: o que dá para arrastar.
-// canDrag(el) diz se aquele item pode; onMove(el, x, y) mostra onde vai cair;
+// canDrag(el, event) diz se aquele item pode; onMove(el, x, y) mostra onde vai cair;
 // onDrop(el) aplica; onEnd() limpa as marcas (sempre roda, até se cancelar).
 export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd }) {
   let pending = null; // apertou, mas ainda não virou arrasto
@@ -65,7 +65,7 @@ export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd }
   root.addEventListener('pointerdown', (e) => {
     if (drag || pending || (e.pointerType === 'mouse' && e.button !== 0)) return;
     const el = e.target.closest(selector);
-    if (!el || !root.contains(el) || !canDrag(el)) return;
+    if (!el || !root.contains(el) || !canDrag(el, e)) return;
     pending = { el, id: e.pointerId, x: e.clientX, y: e.clientY, touch: e.pointerType !== 'mouse' };
     if (pending.touch) pending.timer = setTimeout(begin, HOLD_MS);
   });
