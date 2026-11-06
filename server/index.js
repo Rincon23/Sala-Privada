@@ -199,7 +199,7 @@ const channels = new Map(); // id -> { id, serverId, kind: 'text' | 'voice', nam
 const messages = new Map(); // id do canal -> mensagens em ordem (ficam salvas em data/messages)
 const attachments = new Map(); // id do anexo -> dados, só dos que já estão numa mensagem
 const pendingUploads = new Map(); // anexos enviados que ainda não foram para nenhuma mensagem
-const musics = new Map(); // id da sala de voz -> música tocando nela
+const musics = new Map(); // id da sala de voz -> vídeos dela (o atual e a fila)
 let usage = { month: monthKey(), bytes: 0 };
 let usageDirty = false;
 
@@ -408,7 +408,7 @@ function pauseIfEmpty(channelId) {
   if (m?.playing && !voiceMembers(channelId).length) setPlaying(channelId, false);
 }
 
-// ---------- música (cada sala de voz tem a sua) ----------
+// ---------- vídeos do YouTube (cada sala de voz tem os seus) ----------
 
 function musicOf(channelId) {
   let m = musics.get(channelId);
@@ -427,7 +427,7 @@ function musicState(m) {
   return { queue: m.queue, current: m.current, playing: m.playing, position: musicPosition(m), serverTime: Date.now() };
 }
 
-// Vai para todo mundo que enxerga a sala: a lista de canais mostra onde tem música tocando.
+// Vai para todo mundo que enxerga a sala: a lista de canais mostra onde tem vídeo tocando.
 function broadcastMusic(channelId) {
   broadcastChannel(channelId, { type: 'music', channelId, music: musicState(musicOf(channelId)) });
 }
@@ -834,7 +834,7 @@ function canSeeChannel(p, channelId) {
   return !!c && canSee(p, c.serverId);
 }
 
-// Os servidores, canais e músicas que essa pessoa enxerga.
+// Os servidores, canais e vídeos que essa pessoa enxerga.
 function directoryFor(p) {
   const visible = [...servers.values()].filter((s) => canSee(p, s.id));
   const ids = new Set(visible.map((s) => s.id));
@@ -1306,7 +1306,7 @@ const handlers = {
 
   async 'music:add'(p, msg) {
     const channelId = p.voice;
-    if (!channelId) return send(p.ws, { type: 'notice', text: 'Entre numa sala de voz para colocar música.' });
+    if (!channelId) return send(p.ws, { type: 'notice', text: 'Entre numa sala de voz para colocar vídeos.' });
     const videoId = parseYouTubeId(String(msg.url ?? ''));
     if (!videoId) return send(p.ws, { type: 'notice', text: 'Esse link não parece ser do YouTube.' });
     if (musicOf(channelId).queue.length >= 100) return send(p.ws, { type: 'notice', text: 'A fila está cheia.' });
@@ -1332,7 +1332,7 @@ const handlers = {
   },
 
   'music:skip'(p, msg) {
-    // itemId evita pular duas músicas quando duas pessoas clicam juntas
+    // itemId evita pular dois vídeos quando duas pessoas clicam juntas
     const m = p.voice && musics.get(p.voice);
     if (m?.current && msg.itemId === m.current.id) playItem(p.voice, m.queue.shift());
   },
@@ -1355,7 +1355,7 @@ const handlers = {
     const m = p.voice && musics.get(p.voice);
     if (!m?.current || msg.itemId !== m.current.id) return;
     broadcastVoice(p.voice, { type: 'notice', text: `Não deu para tocar ${m.current.title}: ${ytErrorText(msg.code)}` });
-    log('AVISO', who(p), `o YouTube não tocou "${m.current.title}" (${ytErrorText(msg.code)}); pulei para a próxima`, 'escolher outro vídeo da mesma música');
+    log('AVISO', who(p), `o YouTube não tocou "${m.current.title}" (${ytErrorText(msg.code)}); pulei para a próxima`, 'colocar outro link desse vídeo');
     playItem(p.voice, m.queue.shift());
   },
 

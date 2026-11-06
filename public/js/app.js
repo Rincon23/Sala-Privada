@@ -58,9 +58,9 @@ const state = {
   servers: new Map(),
   server: store.get('server', null), // servidor aberto na lista de canais
   channels: new Map(),
-  musics: new Map(), // id da sala de voz -> música dela
+  musics: new Map(), // id da sala de voz -> os vídeos dela
   sounds: [],
-  music: null, // a música da sala de voz em que estou
+  music: null, // os vídeos da sala de voz em que estou
   usage: null,
   voice: null, // sala de voz em que estou
   view: store.get('view', null), // canal de texto aberto no meio da tela
@@ -2090,7 +2090,7 @@ function renderChannels() {
       row.classList.toggle('active', ch.id === view?.id);
       row.classList.toggle('connected', ch.id === state.voice);
       row.classList.toggle('unread', kind === 'text' && isUnread(ch));
-      const playing = state.musics.get(ch.id)?.playing ? icon('music', 'ch-music') : '';
+      const playing = state.musics.get(ch.id)?.playing ? icon('tvplay', 'ch-music') : '';
       row.innerHTML = `<button class="ch" type="button" data-channel="${ch.id}">${icon(kind === 'voice' ? 'volume' : 'hash')}<span class="ch-name"></span>${playing}</button><button class="icon-btn sm ch-edit" type="button" data-edit="${ch.id}" aria-label="Editar canal" title="Editar canal">${icon('settings')}</button>`;
       $('.ch-name', row).textContent = ch.name;
       group.append(row);
@@ -2979,7 +2979,7 @@ function linkify(el, text) {
   el.append(text.slice(last));
 }
 
-// ---------- música ----------
+// ---------- vídeos do YouTube ----------
 
 function onMusic(channelId, m) {
   state.musics.set(channelId, m);
@@ -2987,7 +2987,7 @@ function onMusic(channelId, m) {
   renderChannels();
 }
 
-// Cada sala de voz tem a sua música; o player toca a da sala em que estou (nenhuma, fora delas).
+// Cada sala de voz tem os seus vídeos; o player toca os da sala em que estou (nenhum, fora delas).
 function syncMusic() {
   state.music = (state.voice && state.musics.get(state.voice)) || null;
   music?.setState(state.music);
@@ -3000,11 +3000,13 @@ function renderMusic() {
   const inVoice = !!state.voice;
   $('#np-title').textContent = current ? current.title : inVoice ? 'Nada tocando' : 'Fora das salas de voz';
   $('#np-by').textContent = current
-    ? `colocada por ${current.by}`
+    ? `colocado por ${current.by}`
     : inVoice
       ? 'Cole um link do YouTube aqui embaixo para começar.'
-      : 'Entre numa sala de voz para ouvir e colocar música. Cada sala tem a sua.';
+      : 'Entre numa sala de voz para ver e colocar vídeos. Cada sala tem os seus.';
   $('#yt-empty').hidden = !!current;
+  $('#yt-full').hidden = !current;
+  if (!current && isVideoFull()) toggleVideoFull(false);
   $('#music-url').disabled = !inVoice;
   $('#music-form button').disabled = !inVoice;
   for (const button of [$('#music-toggle'), $('#mini-toggle')]) {
@@ -3022,7 +3024,7 @@ function renderMusic() {
       li.innerHTML = `<img alt="" loading="lazy"><div class="queue-main"><div class="queue-title"></div><div class="queue-by"></div></div><button class="icon-btn sm" type="button" aria-label="Tirar da fila">${icon('x')}</button>`;
       $('img', li).src = `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`;
       $('.queue-title', li).textContent = item.title;
-      $('.queue-by', li).textContent = `colocada por ${item.by}`;
+      $('.queue-by', li).textContent = `colocado por ${item.by}`;
       $('button', li).dataset.remove = item.id;
       return li;
     }),
@@ -3045,6 +3047,43 @@ function fmtTime(seconds) {
   const m = Math.floor((s % 3600) / 60);
   const rest = String(s % 60).padStart(2, '0');
   return h ? `${h}:${String(m).padStart(2, '0')}:${rest}` : `${m}:${rest}`;
+}
+
+// Tela cheia do vídeo. No iPhone (sem tela cheia para divs) ocupa a tela por CSS.
+function isVideoFull() {
+  return document.fullscreenElement === $('#yt-wrap') || $('#yt-wrap').classList.contains('pseudo-full');
+}
+
+function toggleVideoFull(on = !isVideoFull()) {
+  const wrap = $('#yt-wrap');
+  if (on && !state.music?.current) return;
+  if (!on) {
+    if (document.fullscreenElement === wrap) document.exitFullscreen().catch(() => {});
+    wrap.classList.remove('pseudo-full');
+  } else if (document.fullscreenEnabled && wrap.requestFullscreen) {
+    // Alguns navegadores embutidos nem aceitam nem recusam: depois de 1 s sem tela cheia, vai a de CSS.
+    const fallback = () => {
+      clearTimeout(timer);
+      if (document.fullscreenElement !== wrap) wrap.classList.add('pseudo-full');
+      renderVideoFull();
+    };
+    const timer = setTimeout(fallback, 1000);
+    wrap.requestFullscreen().then(() => clearTimeout(timer), fallback);
+  } else {
+    wrap.classList.add('pseudo-full');
+  }
+  // O estado final só se sabe depois do fullscreenchange; o botão se ajusta lá também.
+  renderVideoFull();
+}
+
+function renderVideoFull() {
+  if (document.fullscreenElement === $('#yt-wrap')) $('#yt-wrap').classList.remove('pseudo-full');
+  const full = isVideoFull();
+  const button = $('#yt-full');
+  $('#yt-wrap').classList.toggle('full', full);
+  button.innerHTML = icon(full ? 'minimize' : 'maximize');
+  button.title = full ? 'Sair da tela cheia (Esc)' : 'Tela cheia (ou dois cliques no vídeo)';
+  button.setAttribute('aria-label', full ? 'Sair da tela cheia' : 'Tela cheia');
 }
 
 function toggleMusic() {
@@ -3554,6 +3593,9 @@ function bindRoomUi() {
     setTab('music');
   });
   $('#music-volume').addEventListener('input', (e) => music?.setVolume(Number(e.target.value)));
+  $('#yt-full').addEventListener('click', () => toggleVideoFull());
+  $('#yt-wrap').addEventListener('dblclick', () => toggleVideoFull());
+  document.addEventListener('fullscreenchange', renderVideoFull);
   $('#progress').addEventListener('click', seekMusic);
   $('#queue').addEventListener('click', (e) => {
     const b = e.target.closest('[data-remove]');
@@ -3564,6 +3606,7 @@ function bindRoomUi() {
   bindSoundpad();
 
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && $('#yt-wrap').classList.contains('pseudo-full')) return toggleVideoFull(false);
     if (e.key === 'Escape' && !$('#soundpad').hidden) return toggleSoundpad(false);
     if (e.key === 'Escape' && state.focusKey && !document.fullscreenElement) {
       state.focusKey = null;

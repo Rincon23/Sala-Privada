@@ -353,7 +353,7 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 }
 .panel { flex: 1; min-height: 0; overflow: auto; padding: 12px; }
 .panel.inactive { display: none; }
-/* A aba de música fica viva fora da tela para o player do YouTube continuar tocando. */
+/* A aba de vídeo fica viva fora da tela para o player do YouTube continuar tocando. */
 .panel.music.inactive {
   display: block; position: absolute; left: -10000px; top: 0; width: 360px; height: 600px; visibility: hidden; pointer-events: none;
 }
@@ -376,6 +376,21 @@ input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
 
 .yt-wrap { position: relative; aspect-ratio: 16 / 9; border-radius: 12px; overflow: hidden; background: #000; }
 .yt-wrap iframe, .yt-wrap #yt-player { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; pointer-events: none; }
+/* Tela cheia do vídeo: o iframe não recebe cliques (o player segue o servidor), então o botão é nosso. */
+.yt-full {
+  position: absolute; top: 8px; right: 8px; z-index: 2; background: rgba(0, 0, 0, 0.55); color: #fff;
+  opacity: 0; transition: opacity 0.15s;
+}
+.yt-wrap:hover .yt-full, .yt-full:focus-visible, .yt-wrap.full .yt-full { opacity: 1; }
+@media (hover: none) { .yt-full { opacity: 1; } }
+.yt-wrap:fullscreen { border-radius: 0; aspect-ratio: auto; width: 100%; height: 100%; }
+.yt-wrap:fullscreen .yt-full { top: 16px; right: 16px; }
+/* No iPhone não dá para pôr uma div em tela cheia: ocupa a tela por CSS. */
+.yt-wrap.pseudo-full {
+  position: fixed; inset: 0; z-index: 1000; border-radius: 0; aspect-ratio: auto;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.yt-wrap.pseudo-full .yt-full { top: calc(12px + env(safe-area-inset-top)); right: calc(12px + env(safe-area-inset-right)); }
 .yt-empty {
   position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; text-align: center;
   color: var(--muted); font-size: 13px; background: var(--panel);

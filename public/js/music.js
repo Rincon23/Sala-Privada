@@ -1,4 +1,4 @@
-// Player do YouTube que segue o estado da música vindo do servidor.
+// Player do YouTube que segue o estado dos vídeos da sala, vindo do servidor.
 // Todo mundo toca o mesmo vídeo no mesmo segundo; o volume é de cada um.
 
 let apiReady = null;
@@ -82,7 +82,7 @@ export class MusicPlayer {
     this.applyVolume();
   }
 
-  // Ensurdecer na call também cala a música.
+  // Ensurdecer na call também cala o vídeo.
   setSilenced(silenced) {
     this.silenced = silenced;
     this.applyVolume();

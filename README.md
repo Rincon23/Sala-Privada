@@ -1,16 +1,16 @@
 # Sala Privada
 
-Uma sala só para a galera: canais de texto que guardam mensagens e imagens, salas de voz com câmera e quantas telas e janelas quiser, música do YouTube sincronizada em cada sala de voz. Cada pessoa entra com a própria conta (e-mail e senha) e dá para instalar como app no PC e no celular.
+Uma sala só para a galera: canais de texto que guardam mensagens e imagens, salas de voz com câmera e quantas telas e janelas quiser, vídeos do YouTube sincronizados em cada sala de voz. Cada pessoa entra com a própria conta (e-mail e senha) e dá para instalar como app no PC e no celular.
 
 - **Contas:** qualquer pessoa cria a conta com nome (ou apelido), e-mail e senha, e confirma o e-mail pelo link que chega (vale 24 h). Depois é só e-mail e senha, e o aparelho fica lembrado por 180 dias. Quem esquece a senha recebe um link para trocar (vale 1 h). Dá para trocar o nome e a senha em Configurações. Cadastro nunca confirmado some em 7 dias.
 - **Host e admins:** quem criar a conta com o `ADMIN_EMAIL` (e confirmar) é o host. Só ele vê **Gerenciar servidores** (no menu do nome do servidor ou em Configurações): cria, renomeia e apaga servidores, copia ou troca o link de convite, coloca e tira membros e desbane. Só o host dá e tira o cargo de admin. Admins (e o host) clicam numa pessoa em **Pessoas** (ou numa sala de voz) para mutar, tirar da sala de voz, expulsar ou banir do servidor; em Configurações → Painel de admin apagam contas. Trocar a senha de quem esqueceu é só com o host (no mesmo painel), ou a pessoa usa "Esqueci minha senha". Admin não mexe em outro admin nem no host.
 - **Servidores e convites:** cada servidor tem um link de convite (`https://site/convite/CODIGO`). Quem abre o link entra ou cria a conta e já cai no servidor; também dá para colar o código em "Entrar com um convite", no menu do nome do servidor. Uma conta pode estar em quantos servidores quiser. Quem ainda não está em nenhum vê uma tela pedindo um convite ao dono do site. Expulso pode voltar pelo convite; banido não (até o host desbanir). Trocar o link faz o antigo parar de funcionar.
 - **Canais de texto:** só admins (e o host) criam, renomeiam e apagam canais de texto e de voz, pelo **+** e pela engrenagem na lista à esquerda. Tudo fica guardado: texto, imagens (dá para colar com Ctrl+V ou arrastar para o chat) e arquivos de até 25 MB. Quem mandou pode apagar a própria mensagem.
-- **Salas de voz:** clicar numa sala entra nela. Cada sala tem a sua voz, câmeras, telas, música, mesa de sons e um chat ao lado. Quem está em outra sala não ouve nem vê nada, e o servidor também barra isso.
+- **Salas de voz:** clicar numa sala entra nela. Cada sala tem a sua voz, câmeras, telas, vídeos, mesa de sons e um chat ao lado. Quem está em outra sala não ouve nem vê nada, e o servidor também barra isso.
 
 - **Site e sinalização:** Node.js num container, publicado pelo Cloudflare Tunnel (sem abrir portas).
 - **Voz, vídeo e telas:** Cloudflare Realtime (SFU). Grátis até 1.000 GB por mês; o app para câmera e telas em 900 GB para nunca passar disso.
-- **Música:** player do YouTube em cada pessoa, sincronizado pelo servidor.
+- **Vídeo:** player do YouTube em cada pessoa, sincronizado pelo servidor. O botão no canto do vídeo (ou dois cliques nele) põe em tela cheia; Esc sai.
 - **Anexos:** imagens e arquivos de até 25 MB, mandados no chat (dá para arrastar para qualquer chat aberto). Não existe mais envio de arquivos grandes.
 - **Mesa de sons:** 11 efeitos gerados por código (`npm run sounds`) e qualquer pessoa pode adicionar os seus, de até 3 minutos (WAV grande demais vira um WAV menor antes de subir). Só um admin tira sons da mesa.
 - **Monitor:** se o áudio ou a câmera de alguém para de chegar, o app refaz a conexão sozinho; se o problema é de quem transmite, o servidor pede para o app dessa pessoa reconectar.
@@ -80,4 +80,4 @@ npm start          # http://localhost:8380
 npm run icons      # regera os PNGs do app a partir do desenho em scripts/make-icons.mjs
 ```
 
-Sem as chaves do Realtime, o chat e a música funcionam; voz e vídeo ficam desligados.
+Sem as chaves do Realtime, o chat e os vídeos funcionam; voz e vídeo ficam desligados.

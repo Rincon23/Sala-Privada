@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Sala Privada</title>
-  <meta name="description" content="Voz, vídeo, compartilhamento de tela e música com os amigos.">
+  <meta name="description" content="Voz, vídeo, compartilhamento de tela e vídeos do YouTube com os amigos.">
   <meta name="theme-color" content="#0d0e12">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
@@ -69,7 +69,7 @@
       <button class="btn secondary block" type="button" data-install hidden><span data-icon="download"></span>Instalar o app</button>
 
       <p class="presence"><span class="dot-live"></span><span id="presence">Vendo quem está na sala…</span></p>
-      <p class="warning" id="join-warning" hidden>Voz e vídeo ainda não foram configurados no servidor. O chat e a música já funcionam.</p>
+      <p class="warning" id="join-warning" hidden>Voz e vídeo ainda não foram configurados no servidor. O chat e os vídeos já funcionam.</p>
     </form>
   </section>
 
@@ -78,10 +78,10 @@
       <button class="icon-btn" id="btn-channels" type="button" aria-label="Canais" title="Canais" data-icon="menu"></button>
       <div class="brand"><img src="/icons/icon.svg" alt="" width="28" height="28"><span>Sala Privada</span></div>
       <div class="mini-player" id="mini" hidden>
-        <span data-icon="music" class="mini-icon"></span>
+        <span data-icon="tvplay" class="mini-icon"></span>
         <button class="mini-title" id="mini-title" type="button"></button>
-        <button class="icon-btn sm" id="mini-toggle" type="button" aria-label="Tocar ou pausar a música"></button>
-        <button class="icon-btn sm" id="mini-skip" type="button" aria-label="Próxima música" data-icon="skip"></button>
+        <button class="icon-btn sm" id="mini-toggle" type="button" aria-label="Tocar ou pausar o vídeo"></button>
+        <button class="icon-btn sm" id="mini-skip" type="button" aria-label="Próximo vídeo" data-icon="skip"></button>
       </div>
       <div class="topbar-actions">
         <button class="btn secondary small" type="button" data-install hidden><span data-icon="download"></span><span class="hide-sm">Instalar app</span></button>
@@ -116,7 +116,7 @@
       <aside class="side">
         <nav class="tabs" role="tablist">
           <button class="tab" data-tab="people" role="tab" type="button"><span data-icon="users"></span>Pessoas <span class="count" id="people-count">0</span></button>
-          <button class="tab" data-tab="music" role="tab" type="button"><span data-icon="music"></span>Música</button>
+          <button class="tab" data-tab="music" role="tab" type="button"><span data-icon="tvplay"></span>Vídeo</button>
           <button class="tab" data-tab="chat" id="tab-chat" role="tab" type="button" hidden><span data-icon="chat"></span>Chat <span class="badge" id="chat-badge" hidden></span></button>
         </nav>
 
@@ -125,17 +125,17 @@
         </div>
 
         <div class="panel music" data-panel="music">
-          <div class="yt-wrap"><div id="yt-player"></div><div class="yt-empty" id="yt-empty">Nenhuma música tocando</div></div>
+          <div class="yt-wrap" id="yt-wrap"><div id="yt-player"></div><div class="yt-empty" id="yt-empty">Nenhum vídeo tocando</div><button class="icon-btn sm yt-full" id="yt-full" type="button" aria-label="Tela cheia" title="Tela cheia (ou dois cliques no vídeo)" data-icon="maximize" hidden></button></div>
           <div class="np">
             <div class="np-title" id="np-title"></div>
             <div class="np-by" id="np-by"></div>
           </div>
-          <div class="progress" id="progress" role="slider" aria-label="Posição da música" tabindex="0"><div class="progress-fill" id="progress-fill"></div></div>
+          <div class="progress" id="progress" role="slider" aria-label="Posição do vídeo" tabindex="0"><div class="progress-fill" id="progress-fill"></div></div>
           <div class="times"><span id="time-cur">0:00</span><span id="time-dur">0:00</span></div>
           <div class="music-ctl">
             <button class="round primary" id="music-toggle" type="button" aria-label="Tocar ou pausar"></button>
             <button class="round" id="music-skip" type="button" aria-label="Próxima" data-icon="skip"></button>
-            <label class="music-vol" title="Volume da música (só para você)"><span data-icon="volume"></span><input type="range" id="music-volume" min="0" max="100" aria-label="Volume da música"></label>
+            <label class="music-vol" title="Volume do vídeo (só para você)"><span data-icon="volume"></span><input type="range" id="music-volume" min="0" max="100" aria-label="Volume do vídeo"></label>
           </div>
           <form class="inline-form" id="music-form">
             <input class="input" id="music-url" placeholder="Cole um link do YouTube" inputmode="url" autocomplete="off">
