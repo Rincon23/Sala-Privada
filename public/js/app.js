@@ -473,6 +473,8 @@ function onMessage(msg) {
       return onHistory(msg);
     case 'chat:deleted':
       return onChatDeleted(msg);
+    case 'chat:cleared':
+      return onChatCleared(msg);
     case 'stream:added':
       return onStreamAdded(msg.stream);
     case 'stream:removed':
@@ -2295,6 +2297,20 @@ function onChatDeleted({ channelId, id }) {
   for (const view of chatViews) if (view.channelId === channelId) renderChatView(view, { keepScroll: true });
 }
 
+// A sala de voz esvaziou e o chat dela foi apagado.
+function onChatCleared({ channelId }) {
+  const ch = state.channels.get(channelId);
+  if (ch) ch.lastTs = 0;
+  const c = chats.get(channelId);
+  if (c) Object.assign(c, { list: [], loaded: true, loading: false, more: false });
+  if (channelId === state.voice) {
+    state.unread = 0;
+    renderBadge();
+  }
+  for (const view of chatViews) if (view.channelId === channelId) renderChatView(view);
+  renderChannels();
+}
+
 function myAuthor() {
   return state.me?.author;
 }
@@ -2473,7 +2489,8 @@ function renderChatView(view, { keepScroll = false } = {}) {
   } else {
     const note = document.createElement('p');
     note.className = 'chat-start';
-    note.textContent = ch ? `Começo de ${channelLabel(ch)}. Mande mensagens, imagens (dá para colar com Ctrl+V) e arquivos: tudo fica guardado aqui.` : '';
+    if (ch?.kind === 'voice') note.textContent = `Começo do chat de ${channelLabel(ch)}. As mensagens daqui somem quando todo mundo sai da sala.`;
+    else note.textContent = ch ? `Começo de ${channelLabel(ch)}. Mande mensagens, imagens (dá para colar com Ctrl+V) e arquivos: tudo fica guardado aqui.` : '';
     items.push(note);
   }
   let prev = null;

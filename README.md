@@ -6,7 +6,7 @@ Uma sala só para a galera: canais de texto que guardam mensagens e imagens, sal
 - **Host e admins:** quem criar a conta com o `ADMIN_EMAIL` (e confirmar) é o host. Só ele vê **Gerenciar servidores** (no menu do nome do servidor ou em Configurações): cria, renomeia e apaga servidores, copia ou troca o link de convite, coloca e tira membros e desbane. Só o host dá e tira o cargo de admin. Admins (e o host) clicam numa pessoa em **Pessoas** (ou numa sala de voz) para mutar, tirar da sala de voz, expulsar ou banir do servidor; em Configurações → Painel de admin apagam contas. Trocar a senha de quem esqueceu é só com o host (no mesmo painel), ou a pessoa usa "Esqueci minha senha". Admin não mexe em outro admin nem no host.
 - **Servidores e convites:** cada servidor tem um link de convite (`https://site/convite/CODIGO`). Quem abre o link entra ou cria a conta e já cai no servidor; também dá para colar o código em "Entrar com um convite", no menu do nome do servidor. Uma conta pode estar em quantos servidores quiser. Quem ainda não está em nenhum vê uma tela pedindo um convite ao dono do site. Expulso pode voltar pelo convite; banido não (até o host desbanir). Trocar o link faz o antigo parar de funcionar.
 - **Canais de texto:** só admins (e o host) criam, renomeiam e apagam canais de texto e de voz, pelo **+** e pela engrenagem na lista à esquerda. Tudo fica guardado: texto, imagens (dá para colar com Ctrl+V ou arrastar para o chat) e arquivos de até 25 MB. Quem mandou pode apagar a própria mensagem.
-- **Salas de voz:** clicar numa sala entra nela. Cada sala tem a sua voz, câmeras, telas, vídeos, mesa de sons e um chat ao lado. Quem está em outra sala não ouve nem vê nada, e o servidor também barra isso.
+- **Salas de voz:** clicar numa sala entra nela. Cada sala tem a sua voz, câmeras, telas, vídeos, mesa de sons e um chat ao lado. Quem está em outra sala não ouve nem vê nada, e o servidor também barra isso. Quando todo mundo sai e a sala fica vazia por 10 s, o chat dela e a fila de vídeos zeram (os canais de texto nunca são apagados).
 
 - **Site e sinalização:** Node.js num container, publicado pelo Cloudflare Tunnel (sem abrir portas).
 - **Voz, vídeo e telas:** Cloudflare Realtime (SFU). Grátis até 1.000 GB por mês; o app para câmera e telas em 900 GB para nunca passar disso.
@@ -70,7 +70,7 @@ Depois recrie o container: `docker compose up -d --force-recreate`.
 
 ### O que fica guardado
 
-Tudo fica no volume `dados` do Docker (`/data` no container): `users.json` (as contas, com as senhas só em hash), `sessions.json` (os aparelhos logados), `servers.json` (os servidores e membros), `channels.json` (os canais), `messages/` (uma linha por mensagem, um arquivo por canal) e `attachments/` (as imagens e arquivos do chat). Para fazer backup das mensagens, copie essa pasta. Apagar um canal apaga as mensagens e imagens dele de vez.
+Tudo fica no volume `dados` do Docker (`/data` no container): `users.json` (as contas, com as senhas só em hash), `sessions.json` (os aparelhos logados), `servers.json` (os servidores e membros), `channels.json` (os canais), `messages/` (uma linha por mensagem, um arquivo por canal) e `attachments/` (as imagens e arquivos do chat). Para fazer backup das mensagens, copie essa pasta. Apagar um canal apaga as mensagens e imagens dele de vez. O chat das salas de voz é apagado sozinho sempre que a sala esvazia.
 
 ## Desenvolvendo
 

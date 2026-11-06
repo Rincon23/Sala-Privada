@@ -71,6 +71,10 @@ const GB = 1e9;
 const RTC_BASE = `https://rtc.live.cloudflare.com/v1/apps/${encodeURIComponent(APP_ID)}`;
 const ICE_SERVERS = [{ urls: 'stun:stun.cloudflare.com:3478' }];
 const RECONNECT_GRACE_MS = 15_000;
+// Sala de voz vazia por este tempo: o chat e os vídeos dela zeram (dá tempo de sair e voltar).
+const EMPTY_ROOM_MS = 10_000;
+// Depois de reiniciar, os apps voltam sozinhos para as salas; só então as que ficaram vazias zeram.
+const BOOT_WIPE_MS = 60_000;
 const STREAM_KINDS = new Set(['mic', 'camera', 'screen']);
 const COLORS = ['#7c6cff', '#ff6b9a', '#34d399', '#f5a524', '#38bdf8', '#fb7185', '#c084fc', '#2dd4bf', '#f97316'];
 
@@ -200,6 +204,7 @@ const messages = new Map(); // id do canal -> mensagens em ordem (ficam salvas e
 const attachments = new Map(); // id do anexo -> dados, só dos que já estão numa mensagem
 const pendingUploads = new Map(); // anexos enviados que ainda não foram para nenhuma mensagem
 const musics = new Map(); // id da sala de voz -> vídeos dela (o atual e a fila)
+const emptyTimers = new Map(); // id da sala de voz vazia -> quando ela vai zerar
 let usage = { month: monthKey(), bytes: 0 };
 let usageDirty = false;
 
@@ -376,7 +381,7 @@ function removeParticipant(p) {
   for (const [sid, owner] of sessions) if (owner === p.id) sessions.delete(sid);
   broadcast({ type: 'participant:left', id: p.id });
   log('INFO', who(p), 'saiu da sala');
-  if (p.voice) pauseIfEmpty(p.voice);
+  if (p.voice) roomMaybeEmpty(p.voice);
 }
 
 function dropStreams(p) {
@@ -398,14 +403,49 @@ function moveVoice(p, channelId) {
   p.voice = channelId;
   dropStreams(p);
   broadcast({ type: 'participant:updated', participant: publicParticipant(p) });
-  if (channelId) log('INFO', who(p), `entrou na sala de voz "${channels.get(channelId).name}"`);
-  if (from) pauseIfEmpty(from);
+  if (channelId) {
+    log('INFO', who(p), `entrou na sala de voz "${channels.get(channelId).name}"`);
+    clearTimeout(emptyTimers.get(channelId));
+    emptyTimers.delete(channelId);
+  }
+  if (from) roomMaybeEmpty(from);
 }
 
-// Sala de voz vazia: pausa a música para ela não "andar sozinha".
-function pauseIfEmpty(channelId) {
+// Sala de voz vazia: o vídeo pausa na hora (para não "andar sozinho") e, se ninguém voltar
+// em EMPTY_ROOM_MS, o chat e os vídeos dela zeram. Quem só caiu da conexão ainda conta
+// como dentro da sala durante RECONNECT_GRACE_MS.
+function roomMaybeEmpty(channelId) {
+  if (voiceMembers(channelId).length) return;
   const m = musics.get(channelId);
-  if (m?.playing && !voiceMembers(channelId).length) setPlaying(channelId, false);
+  if (m?.playing) setPlaying(channelId, false);
+  clearTimeout(emptyTimers.get(channelId));
+  emptyTimers.set(channelId, setTimeout(() => wipeRoom(channelId), EMPTY_ROOM_MS));
+}
+
+// Zera a sala de voz: apaga as mensagens (e anexos) do chat dela e a fila de vídeos.
+// Os canais de texto nunca passam por aqui.
+function wipeRoom(channelId) {
+  emptyTimers.delete(channelId);
+  const c = channels.get(channelId);
+  if (c?.kind !== 'voice' || voiceMembers(channelId).length) return;
+  const list = messages.get(channelId) || [];
+  const m = musics.get(channelId);
+  const videos = m ? (m.current ? 1 : 0) + m.queue.length : 0;
+  if (!list.length && !videos) return;
+  messages.set(channelId, []);
+  for (const msg of list) for (const a of msg.attachments || []) attachments.delete(a.id);
+  musics.delete(channelId);
+  broadcastChannel(channelId, { type: 'chat:cleared', channelId });
+  broadcastChannel(channelId, { type: 'music', channelId, music: musicState(musicOf(channelId)) });
+  musics.delete(channelId); // musicOf recriou vazia só para avisar
+  onDisk('a limpeza da sala de voz', async () => {
+    await unlink(messagesFile(channelId)).catch(() => {});
+    for (const msg of list) for (const a of msg.attachments || []) await unlink(attachPath(a.id)).catch(() => {});
+  });
+  const what = [list.length ? `${list.length} mensage${list.length === 1 ? 'm' : 'ns'}` : '', videos ? `${videos} vídeo${videos === 1 ? '' : 's'}` : '']
+    .filter(Boolean)
+    .join(' e ');
+  log('INFO', null, `a sala de voz "${c.name}" esvaziou; apaguei ${what}`);
 }
 
 // ---------- vídeos do YouTube (cada sala de voz tem os seus) ----------
@@ -2047,6 +2087,9 @@ await loadServers();
 await loadChannels();
 
 setInterval(saveUsage, 30_000);
+setTimeout(() => {
+  for (const c of channels.values()) if (c.kind === 'voice' && !emptyTimers.has(c.id)) wipeRoom(c.id);
+}, BOOT_WIPE_MS);
 setInterval(sweepUploads, 10 * 60_000);
 setInterval(() => {
   if (participants.size) broadcast({ type: 'usage', usage: usageInfo() });
