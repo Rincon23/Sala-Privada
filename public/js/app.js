@@ -235,7 +235,7 @@ async function onJoinSubmit(event) {
   const password = $('#join-pass').value;
   const body = {
     login: { email, password },
-    register: { email, password, name: $('#join-name').value.trim() },
+    register: { email, password, name: $('#join-name').value.trim(), invite: store.get('invite', null) },
     forgot: { email },
     reset: { token: resetToken, password },
   }[authMode];
@@ -251,7 +251,7 @@ async function onJoinSubmit(event) {
   if (email) store.set('email', email);
   if (authMode === 'register') {
     pendingEmail = email;
-    return setAuthMode('sent', `Mandamos um link para ${email}. Abra o e-mail e clique nele para ativar a conta (veja também o spam). O link vale por 24 horas.`);
+    return setAuthMode('sent', `Falta um passo: abra o link que mandamos para ${email} para criar a conta (veja também o spam; ele vale por 24 horas). Digitou o e-mail errado? É só se cadastrar de novo com o certo.`);
   }
   if (authMode === 'forgot') {
     pendingEmail = null;

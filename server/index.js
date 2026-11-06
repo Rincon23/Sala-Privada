@@ -38,6 +38,7 @@ const SOUND_MAX_BYTES = 10 * 1024 * 1024;
 const SOUND_MAX_SECONDS = 180;
 const SOUNDS_MAX = 200;
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const SIGNUPS_FILE = path.join(DATA_DIR, 'signups.json'); // cadastros esperando o clique no link
 const LOGINS_FILE = path.join(DATA_DIR, 'sessions.json');
 const SERVERS_FILE = path.join(DATA_DIR, 'servers.json');
 const SESSION_DAYS = 180;
@@ -199,6 +200,7 @@ const sessions = new Map(); // sessionId do Realtime -> id do participante dono
 const stallReports = new Map(); // id da transmissão -> Map(id de quem reclamou -> quando)
 const sounds = new Map();
 const users = new Map(); // id -> { id, email, name, passHash, createdAt }
+const signups = new Map(); // e-mail -> cadastro que ainda não é conta: { email, name, passHash, createdAt, verify, invite }
 const logins = new Map(); // token do cookie de login -> { userId, createdAt }
 const servers = new Map(); // id -> { id, name, createdAt, invite, members: [ids das contas], banned: [ids das contas] }
 const channels = new Map(); // id -> { id, serverId, kind: 'text' | 'voice', name, createdAt, createdBy }
@@ -729,9 +731,11 @@ async function loadSounds() {
 }
 
 // ---------- contas ----------
-// Cada pessoa cria a conta com e-mail e senha e confirma o e-mail pelo link que chega. A senha só fica
-// guardada como hash (scrypt) em data/users.json; quem entra ganha um cookie com um token guardado em
-// data/sessions.json. Quem confirmar o ADMIN_EMAIL do .env é o host.
+// Cada pessoa se cadastra com e-mail e senha, e a conta só passa a existir quando ela abre o link
+// que chega no e-mail: até lá o cadastro fica à parte, em data/signups.json, e some em 24 h. Assim
+// um e-mail digitado errado nunca vira conta. A senha só fica guardada como hash (scrypt) e as
+// contas ficam em data/users.json; quem entra ganha um cookie com um token guardado em
+// data/sessions.json. Quem criar a conta com o ADMIN_EMAIL do .env é o host.
 
 const scryptAsync = promisify(scrypt);
 
@@ -752,10 +756,11 @@ function publicUser(u) {
 // Links de uso único (confirmar o e-mail, trocar a senha). Só o hash do token fica guardado na conta.
 const tokenHash = (token) => createHash('sha256').update(String(token ?? '')).digest('hex');
 
-function issueToken(user, kind, ms) {
+// holder é uma conta (trocar a senha) ou um cadastro pendente (confirmar o e-mail).
+function issueToken(holder, kind, ms, save = saveUsers) {
   const token = newId(24);
-  user[kind] = { hash: tokenHash(token), exp: Date.now() + ms };
-  saveUsers();
+  holder[kind] = { hash: tokenHash(token), exp: Date.now() + ms };
+  save();
   return token;
 }
 
@@ -766,13 +771,14 @@ function userByToken(kind, token) {
 
 const siteUrl = (req) => PUBLIC_URL || `${isHttps(req) ? 'https' : 'http'}://${req.get('host')}`;
 
-function sendConfirm(req, user) {
-  const url = `${siteUrl(req)}/#confirmar=${issueToken(user, 'verify', VERIFY_MS)}`;
+// Um link novo invalida o anterior do mesmo cadastro.
+function sendConfirm(req, signup) {
+  const url = `${siteUrl(req)}/#confirmar=${issueToken(signup, 'verify', VERIFY_MS, saveSignups)}`;
   return sendMail(
-    user.email,
+    signup.email,
     'Confirme seu e-mail na Sala Privada',
-    `Oi, ${user.name}!\n\nPara ativar sua conta na Sala Privada, abra o link abaixo:\n\n${url}\n\n` +
-      'O link vale por 24 horas. Se não foi você que criou a conta, é só ignorar este e-mail.',
+    `Oi, ${signup.name}!\n\nPara criar sua conta na Sala Privada, abra o link abaixo:\n\n${url}\n\n` +
+      'O link vale por 24 horas. Se não foi você que pediu a conta, é só ignorar este e-mail: nada é criado sem esse clique.',
   );
 }
 
@@ -850,6 +856,27 @@ function saveUsers() {
   return onDisk('as contas', () => writeFile(USERS_FILE, JSON.stringify([...users.values()])));
 }
 
+function saveSignups() {
+  return onDisk('os cadastros pendentes', () => writeFile(SIGNUPS_FILE, JSON.stringify([...signups.values()])));
+}
+
+// Cadastro cujo link venceu some (é só cadastrar de novo).
+function sweepSignups() {
+  const now = Date.now();
+  let gone = 0;
+  for (const [email, s] of signups) {
+    if (s.verify?.exp > now) continue;
+    signups.delete(email);
+    gone++;
+  }
+  if (gone) saveSignups();
+}
+
+function signupByToken(token) {
+  const hash = tokenHash(token);
+  return [...signups.values()].find((s) => s.verify?.hash === hash && s.verify.exp > Date.now()) || null;
+}
+
 function saveLogins() {
   return onDisk('os logins', () => writeFile(LOGINS_FILE, JSON.stringify([...logins])));
 }
@@ -860,14 +887,30 @@ async function loadUsers() {
   } catch {
     // ainda não há contas
   }
-  const stale = Date.now() - 7 * 86_400_000;
+  try {
+    for (const s of JSON.parse(await readFile(SIGNUPS_FILE, 'utf8'))) signups.set(s.email, s);
+  } catch {
+    // ninguém esperando confirmação
+  }
+  let moved = 0;
   for (const u of [...users.values()]) {
     // Contas de antes da confirmação por e-mail já valem.
     u.verified ??= true;
-    // Cadastro nunca confirmado (e-mail errado, ou de outra pessoa) some depois de 7 dias.
-    if (!u.verified && u.createdAt < stale) users.delete(u.id);
+    if (u.verified) continue;
+    // Versão antiga: o cadastro não confirmado era uma conta. Vira cadastro pendente (o link que
+    // já foi por e-mail continua valendo) e sai das contas.
+    users.delete(u.id);
+    moved++;
+    if (u.verify?.exp > Date.now() && !signups.has(u.email)) {
+      signups.set(u.email, { email: u.email, name: u.name, passHash: u.passHash, createdAt: u.createdAt, verify: u.verify, invite: null });
+    }
   }
+  sweepSignups();
   await saveUsers();
+  if (moved) {
+    await saveSignups();
+    log('INFO', null, `${moved} conta${moved === 1 ? '' : 's'} nunca confirmada${moved === 1 ? '' : 's'} virou cadastro pendente (só vira conta pelo link do e-mail)`);
+  }
   const cutoff = Date.now() - SESSION_DAYS * 86_400_000;
   try {
     for (const [token, s] of JSON.parse(await readFile(LOGINS_FILE, 'utf8'))) {
@@ -1640,44 +1683,59 @@ authRoutes.post('/register', async (req, res) => {
   if (!name) return fail(res, 400, 'name', 'Escolha um nome ou apelido.');
   if (!validEmail(email)) return fail(res, 400, 'email', 'Esse e-mail não parece certo.');
   if (password.length < 6) return fail(res, 400, 'password', 'A senha precisa ter pelo menos 6 caracteres.');
-  let user = userByEmail(email);
-  if (user?.verified) return fail(res, 409, 'exists', 'Já existe uma conta com esse e-mail. Entre com ela ou use "Esqueci minha senha".');
+  if (userByEmail(email)) return fail(res, 409, 'exists', 'Já existe uma conta com esse e-mail. Entre com ela ou use "Esqueci minha senha".');
   const passHash = await hashPassword(password);
-  // Cadastro que nunca foi confirmado (e-mail digitado errado, ou alguém usando o e-mail dos outros): recomeça.
-  if (!user) {
-    user = { id: newId(), email, createdAt: Date.now() };
-    users.set(user.id, user);
-  }
-  Object.assign(user, { name, passHash, verified: false });
-  saveUsers();
-  if (!(await sendConfirm(req, user))) return fail(res, 503, 'mail', 'Não deu para mandar o e-mail de confirmação agora. Tente de novo daqui a pouco.');
-  log('INFO', null, `${name} criou uma conta (${email}); falta confirmar o e-mail`);
+  // Ainda não é conta: só vira quando o link do e-mail for aberto. Cadastrar de novo com o mesmo
+  // e-mail substitui o pendente (e o link antigo para de valer).
+  const invite = serverByInvite(cleanInvite(req.body?.invite))?.invite || null;
+  const signup = { email, name, passHash, createdAt: Date.now(), invite };
+  signups.set(email, signup);
+  if (!(await sendConfirm(req, signup))) return fail(res, 503, 'mail', 'Não deu para mandar o e-mail de confirmação agora. Tente de novo daqui a pouco.');
+  log('INFO', null, `${name} pediu uma conta (${email}); ela só é criada quando o link do e-mail for aberto`);
   res.json({ pending: true, email });
 });
 
 // O link do e-mail abre o site com o token; o app manda para cá e já entra.
+// Só aqui a conta é criada. Quem veio por um convite já cai no servidor dele, mesmo abrindo o
+// link em outro aparelho.
 authRoutes.post('/verify', (req, res) => {
-  const user = userByToken('verify', req.body?.token);
-  if (!user) return fail(res, 400, 'link', 'Esse link de confirmação expirou ou já foi usado. Entre com o seu e-mail e senha para receber outro.');
-  user.verified = true;
-  delete user.verify;
+  const signup = signupByToken(req.body?.token);
+  if (!signup) return fail(res, 400, 'link', 'Esse link de confirmação expirou ou já foi usado. Se a conta ainda não existe, é só se cadastrar de novo.');
+  signups.delete(signup.email);
+  saveSignups();
+  if (userByEmail(signup.email)) return fail(res, 409, 'exists', 'Essa conta já foi criada. Entre com o seu e-mail e senha.');
+  const user = { id: newId(), email: signup.email, name: signup.name, passHash: signup.passHash, createdAt: Date.now(), verified: true };
+  users.set(user.id, user);
   saveUsers();
+  const server = serverByInvite(signup.invite);
+  if (server && !server.members.includes(user.id) && !server.banned.includes(user.id)) {
+    server.members.push(user.id);
+    saveServers();
+  }
   startLogin(req, res, user);
-  log('INFO', null, `${user.name} confirmou o e-mail (${user.email})${isHost(user) ? ' e é o host da sala' : ''}`);
+  log('INFO', null, `${user.name} confirmou o e-mail e a conta foi criada (${user.email})${isHost(user) ? '; é o host da sala' : ''}${server ? `; entrou em "${server.name}" pelo convite` : ''}`);
   res.json(publicUser(user));
 });
 
 authRoutes.post('/login', async (req, res) => {
   if (blocked(req)) return fail(res, 429, 'too_many', TOO_MANY);
-  const user = userByEmail(cleanEmail(req.body?.email));
-  if (!user || !(await checkPassword(req.body?.password, user.passHash))) {
+  const email = cleanEmail(req.body?.email);
+  const user = userByEmail(email);
+  if (!user) {
+    // Cadastro ainda não confirmado: com a senha certa, manda o link de novo. Com a errada, a
+    // resposta é a de sempre, para ninguém descobrir quais e-mails se cadastraram.
+    const signup = signups.get(email);
+    if (signup && (await checkPassword(req.body?.password, signup.passHash))) {
+      const sent = await sendConfirm(req, signup);
+      const where = sent ? `Mandamos um link novo para ${email}` : `Procure o link que mandamos para ${email}`;
+      return fail(res, 403, 'unverified', `Falta confirmar o e-mail para a conta ser criada. ${where} (veja também o spam).`);
+    }
     failed(req);
     return fail(res, 401, 'login', 'E-mail ou senha incorretos.');
   }
-  if (!user.verified) {
-    const sent = await sendConfirm(req, user);
-    const where = sent ? `Mandamos um link novo para ${user.email}` : `Procure o link que mandamos para ${user.email}`;
-    return fail(res, 403, 'unverified', `Falta confirmar o e-mail. ${where} (veja também o spam).`);
+  if (!(await checkPassword(req.body?.password, user.passHash))) {
+    failed(req);
+    return fail(res, 401, 'login', 'E-mail ou senha incorretos.');
   }
   startLogin(req, res, user);
   res.json(publicUser(user));
@@ -1694,21 +1752,19 @@ authRoutes.post('/forgot', (req, res) => {
 });
 
 authRoutes.post('/resend', (req, res) => {
-  const user = userByEmail(cleanEmail(req.body?.email));
-  if (user && !user.verified) sendConfirm(req, user);
+  const signup = signups.get(cleanEmail(req.body?.email));
+  if (signup) sendConfirm(req, signup);
   res.json({ ok: true });
 });
 
-// Quem abriu o link do e-mail é dono dele: a conta fica confirmada e os outros aparelhos saem.
+// Quem abriu o link do e-mail é dono dele: a senha muda e os outros aparelhos saem.
 authRoutes.post('/reset', async (req, res) => {
   const user = userByToken('reset', req.body?.token);
   if (!user) return fail(res, 400, 'link', 'Esse link expirou ou já foi usado. Peça outro em "Esqueci minha senha".');
   const password = String(req.body?.password ?? '');
   if (password.length < 6) return fail(res, 400, 'password', 'A senha precisa ter pelo menos 6 caracteres.');
   user.passHash = await hashPassword(password);
-  user.verified = true;
   delete user.reset;
-  delete user.verify;
   saveUsers();
   endLogins(user.id);
   kickUser(user.id, 'A senha da sua conta foi trocada. Entre de novo com a senha nova.');
@@ -2239,6 +2295,7 @@ await loadServers();
 await loadChannels();
 
 setInterval(saveUsage, 30_000);
+setInterval(sweepSignups, 10 * 60_000);
 setTimeout(() => {
   for (const c of channels.values()) if (c.kind === 'voice' && !emptyTimers.has(c.id)) wipeRoom(c.id);
 }, BOOT_WIPE_MS);
@@ -2273,7 +2330,7 @@ server.listen(PORT, () => {
   if (!ADMIN_EMAIL) {
     log('AVISO', null, 'não há host: ninguém consegue criar servidores, dar o cargo de admin nem trocar senhas', 'preencha ADMIN_EMAIL no .env, rode "docker compose up -d --force-recreate" e crie a conta com esse e-mail');
   } else if (![...users.values()].some(isHost)) {
-    log('INFO', null, `o host (${ADMIN_EMAIL}) ainda não tem conta: é só criar a conta com esse e-mail e confirmar pelo link que chega`);
+    log('INFO', null, `o host (${ADMIN_EMAIL}) ainda não tem conta: é só se cadastrar com esse e-mail e abrir o link que chega`);
   }
   if (!SMTP_HOST) {
     log(
