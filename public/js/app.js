@@ -427,7 +427,7 @@ function onMessage(msg) {
       const p = msg.participant;
       const prev = state.participants.get(p.id);
       // A minha sala de voz quem decide é este app (o aviso do servidor pode chegar atrasado).
-      if (p.id === state.me?.id) p.voice = state.voice;
+      if (p.id === state.me?.id) Object.assign(p, { voice: state.voice, connecting: voiceConn.sent });
       else if (state.voice && prev?.voice !== p.voice) {
         if (p.voice === state.voice) sound('join');
         else if (prev?.voice === state.voice) sound('leave');
@@ -600,6 +600,7 @@ function enterRoom() {
   setInterval(reportUsage, 15000);
   setInterval(checkHealth, 3000);
   setInterval(updateSpeaking, 100);
+  setInterval(tickConnect, 250);
   const stageObserver = new ResizeObserver(layoutGrid);
   stageObserver.observe($('#grid'));
   stageObserver.observe($('#focus'));
@@ -614,6 +615,133 @@ function enterRoom() {
 }
 
 // ---------- salas de voz ----------
+
+// ---------- conectando a voz ----------
+// Ao entrar numa sala de voz (ou quando a conexão é refeita), um checklist mostra o que já
+// funciona. Ele é calculado do estado real: assinaturas que chegaram, microfone no ar e a
+// conexão de envio pronta. Os outros veem três pontinhos até eu poder ouvir e falar.
+
+const CONNECT_SHOW_MS = 300; // pronto antes disso: o painel nem aparece
+const CONNECT_GIVEUP_MS = 30_000; // depois disso os outros param de ver "conectando" (os erros já viram aviso)
+const voiceConn = { since: 0, label: '', shown: false, dismissed: false, doneTimer: null, sent: false, micError: '' };
+
+function voiceLog(step) {
+  if (voiceConn.since) console.info(`[voz] ${step} em ${Math.round(performance.now() - voiceConn.since)} ms`);
+}
+
+function startConnect(label) {
+  if (!state.config?.realtimeReady || !state.voice) return;
+  clearTimeout(voiceConn.doneTimer);
+  Object.assign(voiceConn, { since: performance.now(), label, dismissed: false, doneTimer: null });
+  if (label !== 'Reconectando…') voiceConn.micError = '';
+  tickConnect();
+}
+
+// Cada etapa: 'ok', 'wait' (pulsando), 'off' (não se aplica agora) ou 'error'.
+function voiceSteps() {
+  if (!state.voice || !state.config?.realtimeReady) return null;
+  const wanted = wantedStreams();
+  const arrived = (list) => (list.every((s) => subs.get(s.id)?.status === 'ok') ? 'ok' : 'wait');
+  const hearing = wanted.filter((s) => s.kind === 'mic');
+  const seeing = wanted.filter((s) => s.kind !== 'mic');
+  const retrying = (list) => (list.some((s) => subs.get(s.id)?.status === 'error') ? 'tentando de novo' : '');
+  let talk = 'wait';
+  let talkNote = '';
+  if (state.account?.muted) [talk, talkNote] = ['off', 'mutado por um admin'];
+  else if (voiceConn.micError) [talk, talkNote] = ['error', voiceConn.micError];
+  else if (!state.micOn) [talk, talkNote] = ['off', 'microfone desligado'];
+  else if (local.mic?.live) talk = 'ok';
+  const sending = local.mic || local.camera || local.screens.size || micStarting || camStarting;
+  const cam = sender?.ready ? 'ok' : sending ? 'wait' : 'off';
+  return [
+    { id: 'listen', label: 'Ouvir', state: arrived(hearing), note: retrying(hearing) },
+    { id: 'watch', label: 'Ver câmeras e telas', state: arrived(seeing), note: retrying(seeing) },
+    { id: 'cam', label: 'Ligar a câmera', state: cam, note: cam === 'off' ? 'conecta quando você ligar' : '' },
+    { id: 'talk', label: 'Falar', state: talk, note: talkNote },
+  ];
+}
+
+const DOTS = '<span class="dots" title="Conectando a voz…"><i></i><i></i><i></i></span>';
+
+const STEP_MARK = {
+  ok: () => icon('check'),
+  wait: () => '<span class="dots"><i></i><i></i><i></i></span>',
+  off: () => icon('minus'),
+  error: () => icon('x'),
+};
+
+function tickConnect() {
+  const steps = voiceConn.since ? voiceSteps() : null;
+  const elapsed = performance.now() - voiceConn.since;
+  const waiting = !!steps?.some((st) => st.state === 'wait');
+  const failed = !!steps?.some((st) => st.state === 'error');
+  // Para os outros: ainda não ouço ou ainda não falo.
+  const connecting = !!steps && elapsed < CONNECT_GIVEUP_MS && steps.some((st) => (st.id === 'talk' || st.id === 'listen') && st.state === 'wait');
+  setConnecting(connecting);
+
+  const panel = $('#connect-panel');
+  if (!steps) {
+    voiceConn.since = 0;
+    voiceConn.shown = false;
+    panel.hidden = true;
+    return;
+  }
+  if (!waiting && !failed) {
+    // Tudo pronto: quem viu o painel vê o "pronto" por um instante.
+    voiceConn.since = 0;
+    if (voiceConn.shown && !panel.hidden) {
+      renderConnectPanel('Tudo pronto', steps, false);
+      clearTimeout(voiceConn.doneTimer);
+      voiceConn.doneTimer = setTimeout(() => {
+        if (!voiceConn.since) panel.hidden = true;
+      }, 1000);
+    } else {
+      panel.hidden = true;
+    }
+    voiceConn.shown = false;
+    return;
+  }
+  if (voiceConn.dismissed || (elapsed < CONNECT_SHOW_MS && !failed)) return;
+  voiceConn.shown = true;
+  renderConnectPanel(waiting ? voiceConn.label : 'Nem tudo conectou', steps, failed);
+}
+
+function renderConnectPanel(title, steps, failed) {
+  $('#connect-title').textContent = title;
+  $('#connect-steps').replaceChildren(
+    ...steps.map((st) => {
+      const li = document.createElement('li');
+      li.className = st.state;
+      li.innerHTML = `<span class="mark">${STEP_MARK[st.state]()}</span><span><span class="label"></span> <span class="note"></span></span>`;
+      $('.label', li).textContent = st.label;
+      $('.note', li).textContent = st.note ? `(${st.note})` : '';
+      return li;
+    }),
+  );
+  $('#connect-retry').hidden = !failed;
+  $('#connect-panel').hidden = false;
+}
+
+function setConnecting(connecting) {
+  if (connecting === voiceConn.sent) return;
+  voiceConn.sent = connecting;
+  const me = state.participants.get(state.me?.id);
+  if (me) me.connecting = connecting;
+  if (state.voice) send({ type: 'voice:status', connecting });
+  renderPeople();
+  renderStage();
+  renderChannels();
+}
+
+function retryConnect() {
+  voiceConn.micError = '';
+  if (!state.account?.muted) {
+    state.micOn = true;
+    sendState();
+    applyMic();
+  }
+  startConnect('Conectando a voz…');
+}
 
 function inMyVoice(pid) {
   return !!state.voice && state.participants.get(pid)?.voice === state.voice;
@@ -633,10 +761,14 @@ function joinVoice(id, { show = true } = {}) {
   }
   state.voice = id;
   setMyVoice(id);
-  send({ type: 'voice:join', channelId: id });
+  send({ type: 'voice:join', channelId: id, connecting: !!state.config.realtimeReady });
+  voiceConn.sent = !!state.config.realtimeReady;
   unlockAudio();
   sound('join');
   if (state.config.realtimeReady) {
+    startConnect('Conectando a voz…');
+    receiver?.prewarm();
+    if (state.micOn && !state.account?.muted) sender?.prewarm();
     if (state.micOn) startMic();
     if (joinInfo.startCam) {
       joinInfo.startCam = false;
@@ -661,6 +793,9 @@ function leaveVoice({ notify = true } = {}) {
   state.previewing.clear();
   state.pinned = [];
   state.tileOrder = null;
+  voiceConn.since = 0;
+  voiceConn.sent = false;
+  $('#connect-panel').hidden = true;
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   toggleSoundpad(false);
   stopSounds(); // os sons eram daquela sala
@@ -709,6 +844,7 @@ function makeConnection(role) {
 async function rebuildSender() {
   if (state.leaving) return;
   sender = makeConnection('sender');
+  if (state.voice && !voiceConn.since) startConnect('Reconectando…');
   for (const entry of localEntries()) {
     try {
       await pushEntry(entry);
@@ -724,6 +860,7 @@ function rebuildReceiver() {
   for (const sub of subs.values()) detachAudio(sub);
   subs.clear();
   receiver = makeConnection('receiver');
+  if (state.voice && !voiceConn.since) startConnect('Reconectando…');
   reconcile();
   renderAll();
 }
@@ -740,6 +877,7 @@ async function pushEntry(entry) {
 }
 
 function announce(entry) {
+  entry.live = true;
   send({
     type: 'stream:publish',
     stream: {
@@ -804,6 +942,7 @@ async function startMic() {
   let entry = null;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+    voiceLog('o navegador liberou o microfone');
     // Saiu da sala de voz enquanto o navegador pedia o microfone.
     if (state.voice !== voice) return stream.getTracks().forEach((t) => t.stop());
     const track = stream.getAudioTracks()[0];
@@ -813,6 +952,7 @@ async function startMic() {
     local.mic = entry;
     attachMeter(state.me.id, stream);
     await publishLocal(entry, () => local.mic === entry && state.voice === voice);
+    voiceLog('o microfone está no ar (já dá para falar)');
   } catch (err) {
     if (entry && local.mic === entry) {
       entry.stream.getTracks().forEach((t) => t.stop());
@@ -821,6 +961,7 @@ async function startMic() {
     }
     state.micOn = false;
     sendState();
+    voiceConn.micError = explain(err, 'mic').text;
     reportError(err, 'mic');
   } finally {
     micStarting = false;
@@ -1054,6 +1195,7 @@ async function subscribe(stream) {
     for (const g of got) sub.mediaStream.addTrack(g.track);
     sub.status = 'ok';
     sub.since = Date.now();
+    if (voiceConn.since) voiceLog(`${streamLabel(stream)} começou a chegar`);
     retries.delete(stream.id);
     rebuildAttempts.receiver = 0;
     attachAudio(sub);
@@ -1498,6 +1640,7 @@ function renderPeople() {
     li.dataset.speaker = p.id;
     li.dataset.id = p.id;
     li.classList.toggle('offline', !p.online);
+    li.classList.toggle('connecting', !!p.connecting && !!p.voice);
     li.classList.toggle('expanded', state.expanded === p.id && !mine);
 
     const where = p.voice && state.channels.get(p.voice);
@@ -1505,11 +1648,11 @@ function renderPeople() {
     if (p.online && !where) status = 'Fora das salas de voz';
     else if (p.online) {
       const doing = [hasCam && 'câmera ligada', screens && `${screens} ${screens > 1 ? 'telas' : 'tela'} ao vivo`].filter(Boolean).join(' · ');
-      status = `Em ${where.name} · ${doing || (p.deafened ? 'sem ouvir' : p.micOn ? 'na call' : 'mutado')}`;
+      status = `Em ${where.name} · ${p.connecting ? 'conectando a voz…' : doing || (p.deafened ? 'sem ouvir' : p.micOn ? 'na call' : 'mutado')}`;
     }
     if (p.muted) status += ' · mutado por um admin';
     const icons = where
-      ? [!p.micOn && icon('mic-off', 'bad'), p.deafened && icon('headphones-off', 'bad'), hasCam && icon('video'), screens && icon('monitor')]
+      ? [p.connecting && DOTS, !p.micOn && icon('mic-off', 'bad'), p.deafened && icon('headphones-off', 'bad'), hasCam && icon('video'), screens && icon('monitor')]
           .filter(Boolean)
           .join('')
       : '';
@@ -1651,6 +1794,7 @@ function createTile(key) {
   el.innerHTML = `
     <video autoplay playsinline muted></video>
     <div class="avatar"></div>
+    <span class="tile-dots dots" title="Conectando a voz…"><i></i><i></i><i></i></span>
     <div class="tile-status"></div>
     <div class="tile-label"><span class="tile-icons"></span><span class="name"></span></div>
     <div class="tile-actions"></div>`;
@@ -1714,6 +1858,7 @@ function updateTile(key, tile) {
     }
     icons = [!p.micOn && icon('mic-off', 'bad'), p.deafened && icon('headphones-off', 'bad')].filter(Boolean).join('');
     tile.el.classList.toggle('offline', !p.online);
+    tile.el.classList.toggle('connecting', !!p.connecting && p.online);
     if (!p.online) status = 'Reconectando…';
   } else {
     const info = screenList().find((s) => s.id === id);
@@ -2215,7 +2360,10 @@ function renderChannels() {
         li.dataset.speaker = p.id;
         li.dataset.member = p.id;
         li.classList.toggle('offline', !p.online);
+        li.classList.toggle('connecting', !!p.connecting);
+        if (p.connecting) li.title = 'Conectando a voz…';
         const icons = [
+          p.connecting && DOTS,
           (mine ? local.camera : cameraOf(p.id)) && icon('video'),
           screenCountOf(p.id) && icon('monitor'),
           !p.micOn && icon('mic-off', 'bad'),
@@ -3751,6 +3899,11 @@ function bindRoomUi() {
     setTab('music');
   });
   $('#music-volume').addEventListener('input', (e) => music?.setVolume(Number(e.target.value)));
+  $('#connect-close').addEventListener('click', () => {
+    voiceConn.dismissed = true;
+    $('#connect-panel').hidden = true;
+  });
+  $('#connect-retry').addEventListener('click', retryConnect);
   $('#yt-full').addEventListener('click', () => toggleVideoFull());
   $('#yt-wrap').addEventListener('dblclick', () => toggleVideoFull());
   document.addEventListener('fullscreenchange', renderVideoFull);

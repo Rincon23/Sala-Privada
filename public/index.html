@@ -103,6 +103,11 @@
       <div class="channels-backdrop" id="channels-backdrop"></div>
 
       <section class="stage" id="stage" hidden>
+        <div class="connect-panel" id="connect-panel" role="status" aria-live="polite" hidden>
+          <div class="connect-head"><strong id="connect-title"></strong><button class="icon-btn sm" id="connect-close" type="button" aria-label="Esconder" title="Esconder" data-icon="x"></button></div>
+          <ul class="connect-steps" id="connect-steps"></ul>
+          <button class="btn secondary small" id="connect-retry" type="button" hidden>Tentar de novo</button>
+        </div>
         <div class="livebar" id="livebar" hidden></div>
         <div class="focus" id="focus" hidden></div>
         <div class="grid" id="grid"></div>

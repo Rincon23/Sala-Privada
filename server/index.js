@@ -219,6 +219,7 @@ function publicParticipant(p) {
     voice: p.voice,
     micOn: p.micOn,
     deafened: p.deafened,
+    connecting: !!p.connecting,
     online: p.online,
     joinedAt: p.joinedAt,
     userId: p.userId,
@@ -404,6 +405,7 @@ function moveVoice(p, channelId) {
   const from = p.voice;
   if (from === channelId) return;
   p.voice = channelId;
+  if (!channelId) p.connecting = false;
   dropStreams(p);
   broadcast({ type: 'participant:updated', participant: publicParticipant(p) });
   if (channelId) {
@@ -1183,7 +1185,17 @@ const handlers = {
     if (id && (channels.get(id)?.kind !== 'voice' || !canSeeChannel(p, id))) {
       return send(p.ws, { type: 'voice:ended', text: 'Essa sala de voz não existe mais.' });
     }
+    // Quem entra ainda não está ouvindo nem falando: os outros veem "conectando" até o app avisar.
+    p.connecting = !!id && !!msg.connecting;
     moveVoice(p, id);
+  },
+
+  // O app avisa quando a voz terminou de conectar (ou voltou a conectar).
+  'voice:status'(p, msg) {
+    const connecting = !!p.voice && !!msg.connecting;
+    if (connecting === !!p.connecting) return;
+    p.connecting = connecting;
+    broadcast({ type: 'participant:updated', participant: publicParticipant(p) });
   },
 
   'channel:create'(p, msg) {

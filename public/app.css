@@ -266,7 +266,35 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 .chat-start { color: var(--faint); font-size: 13px; margin: auto 0 4px; }
 .load-older { align-self: center; flex: none; }
 
-.stage { grid-area: center; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 12px; }
+.stage { grid-area: center; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 12px; position: relative; }
+
+/* Conectando a voz: o checklist de quem entrou e os três pontinhos que os outros veem. */
+.connect-panel {
+  position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 6; width: min(300px, calc(100% - 24px));
+  padding: 12px 12px 10px 14px; border-radius: var(--radius); background: var(--panel-2); border: 1px solid var(--border);
+  box-shadow: var(--shadow); font-size: 13px;
+}
+.connect-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.connect-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.connect-steps li { display: grid; grid-template-columns: 18px 1fr; align-items: center; gap: 8px; color: var(--muted); }
+.connect-steps li.ok { color: var(--text); }
+.connect-steps .mark { display: grid; place-items: center; width: 18px; height: 18px; }
+.connect-steps .mark .i { width: 15px; height: 15px; }
+.connect-steps li.ok .mark { color: var(--ok); }
+.connect-steps li.error .mark { color: var(--danger); }
+.connect-steps li.wait .label { animation: breathe 1.4s ease-in-out infinite; }
+.connect-steps .note { color: var(--faint); font-size: 12px; }
+#connect-retry { margin-top: 8px; }
+@keyframes breathe { 50% { opacity: 0.45; } }
+.dots { display: inline-flex; align-items: center; gap: 3px; }
+.dots i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: dot 1.2s ease-in-out infinite; }
+.dots i:nth-child(2) { animation-delay: 0.15s; }
+.dots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes dot { 0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); } 40% { opacity: 1; transform: scale(1); } }
+.tile-dots { position: absolute; left: 50%; top: calc(50% + clamp(26px, 13cqw, 66px)); transform: translateX(-50%); color: var(--text); display: none; }
+.tile.connecting .tile-dots { display: inline-flex; }
+.tile.connecting .avatar, .person.connecting .avatar, .ch-member.connecting .avatar { opacity: 0.45; }
+.ch-member .dots, .person-icons .dots { color: var(--muted); }
 
 .livebar { display: flex; gap: 8px; overflow-x: auto; flex: none; padding-bottom: 2px; scrollbar-width: thin; }
 .chip {

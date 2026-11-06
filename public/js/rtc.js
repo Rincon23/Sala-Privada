@@ -147,8 +147,25 @@ export class SfuConnection extends EventTarget {
       }
     });
     this.pc = pc;
-    const { sessionId } = await this.api.newSession();
-    this.sessionId = sessionId;
+    try {
+      const { sessionId } = await this.api.newSession();
+      this.sessionId = sessionId;
+    } catch (err) {
+      // Sem sessão a conexão não serve: a próxima tentativa começa do zero.
+      this.pc = null;
+      pc.close();
+      throw err;
+    }
+  }
+
+  // Cria a sessão no Cloudflare antes da primeira faixa (em paralelo com o pedido do microfone).
+  prewarm() {
+    return this.enqueue(() => this.ensure()).catch(() => {});
+  }
+
+  // Pronta para mandar ou receber mídia agora.
+  get ready() {
+    return !this.closed && this.pc?.connectionState === 'connected';
   }
 
   fail(err) {
