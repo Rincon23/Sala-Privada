@@ -1559,7 +1559,7 @@ function onPersonAction(act, p) {
   if (act === 'role') {
     const ask = p.admin
       ? `Tirar o cargo de admin de ${p.name}?`
-      : `Tornar ${p.name} admin? A pessoa vai poder mutar, expulsar e banir quem não é admin, trocar senhas, apagar contas, tirar sons da mesa e arrastar canais e pessoas.`;
+      : `Tornar ${p.name} admin? A pessoa vai poder mutar, expulsar e banir quem não é admin, apagar contas, tirar sons da mesa e arrastar canais e pessoas.`;
     if (!confirm(ask)) return;
     return adminApi('PUT', `/users/${p.userId}/admin`, { admin: !p.admin }).catch((err) => toast(err.message));
   }
@@ -2923,9 +2923,11 @@ function renderAdmin() {
       // Só o host dá e tira o cargo; a conta de outro admin, só ele mexe.
       const roleLabel = u.admin ? 'Tirar o cargo de admin' : 'Tornar admin';
       const role = host && !u.host ? `<button class="icon-btn sm role-btn${u.admin ? ' on' : ''}" type="button" data-act="role" aria-label="${roleLabel}" title="${roleLabel}">${icon('shield')}</button>` : '';
+      // Trocar a senha de alguém, só o host.
+      const pass = host ? '<button class="btn secondary small" type="button" data-act="password">Nova senha</button>' : '';
       const manage =
         !u.host && (!u.admin || host)
-          ? `<button class="btn secondary small" type="button" data-act="password">Nova senha</button><button class="icon-btn sm" type="button" data-act="delete-user" aria-label="Apagar conta" title="Apagar conta">${icon('trash')}</button>`
+          ? `${pass}<button class="icon-btn sm" type="button" data-act="delete-user" aria-label="Apagar conta" title="Apagar conta">${icon('trash')}</button>`
           : '';
       li.innerHTML = `<div class="admin-row"><div class="admin-main"><div class="admin-name"></div><div class="admin-sub"></div></div>${tag}${role}${manage}</div>`;
       $('.admin-name', li).textContent = u.name;
@@ -2948,7 +2950,7 @@ function bindAdmin() {
     if (b.dataset.act === 'role') {
       const ask = u.admin
         ? `Tirar o cargo de admin de ${u.name}?`
-        : `Tornar ${u.name} admin? A pessoa vai poder mutar, expulsar e banir quem não é admin, trocar senhas, apagar contas, tirar sons da mesa e arrastar canais e pessoas.`;
+        : `Tornar ${u.name} admin? A pessoa vai poder mutar, expulsar e banir quem não é admin, apagar contas, tirar sons da mesa e arrastar canais e pessoas.`;
       if (!confirm(ask)) return;
       adminAction(async () => {
         await adminApi('PUT', `/users/${u.id}/admin`, { admin: !u.admin });

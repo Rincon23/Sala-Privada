@@ -833,7 +833,7 @@ function failed(req) {
   const now = Date.now();
   const f = failures.get(ip);
   if (!f || f.until < now) failures.set(ip, { count: 1, until: now + 10 * 60_000 });
-  else if (++f.count === 10) log('AVISO', null, `10 senhas erradas seguidas vindas de ${ip}; esse endereço espera 10 minutos`, 'nada se foi alguém da sala esquecendo a senha (o admin pode trocar a senha da pessoa no painel)');
+  else if (++f.count === 10) log('AVISO', null, `10 senhas erradas seguidas vindas de ${ip}; esse endereço espera 10 minutos`, 'nada se foi alguém da sala esquecendo a senha (o host pode trocar a senha da pessoa no Painel de admin, ou ela usa "Esqueci minha senha")');
 }
 
 // ---------- servidores ----------
@@ -1614,7 +1614,9 @@ function protectedAccount(req, user) {
   return null;
 }
 
+// Trocar a senha de alguém é só do host: quem esqueceu fala com ele (ou usa "Esqueci minha senha").
 adminRoutes.post('/users/:id/password', async (req, res) => {
+  if (!isHost(req.user)) return fail(res, 403, 'host', 'Só o host troca a senha de alguém. A pessoa também pode usar "Esqueci minha senha".');
   const user = users.get(req.params.id);
   if (!user) return fail(res, 404, 'not_found', 'Essa conta não existe mais.');
   const locked = protectedAccount(req, user);
@@ -1624,8 +1626,8 @@ adminRoutes.post('/users/:id/password', async (req, res) => {
   user.passHash = await hashPassword(password);
   saveUsers();
   endLogins(user.id);
-  kickUser(user.id, 'O admin trocou a sua senha. Entre de novo com a senha nova.');
-  log('INFO', null, `o admin trocou a senha de ${user.name} (${user.email})`);
+  kickUser(user.id, 'O host trocou a sua senha. Entre de novo com a senha nova.');
+  log('INFO', null, `o host trocou a senha de ${user.name} (${user.email})`);
   res.json({ ok: true });
 });
 
