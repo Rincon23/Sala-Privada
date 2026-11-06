@@ -32,7 +32,7 @@ Cada problema aparece com o que aconteceu e, logo abaixo, **→ O que fazer**. E
 
 ## Rodando no servidor
 
-O servidor monta o app a partir da `main` no GitHub, nunca do PC: só entra no ar o que já teve **push** na `main`.
+O app roda no Orange Pi (`orangepi@100.81.141.54`, Tailscale) e monta o app a partir da `main` no GitHub, nunca do PC: só entra no ar o que já teve **push** na `main`.
 
 Primeira vez:
 
@@ -46,12 +46,12 @@ docker compose up -d --build
 Para atualizar, depois do push:
 
 ```bash
-ssh rincon@100.64.38.33 'cd ~/sala-privada && ./update.sh'
+ssh orangepi@100.81.141.54 'cd ~/sala-privada && ./update.sh'
 ```
 
 O `update.sh` puxa a `main`, remonta o container e mostra qual commit ficou no ar, com o status e o log. O `.env` fica só no servidor e nunca vai para o GitHub.
 
-No Cloudflare Tunnel, a rota de `live.rincon.dev.br` aponta para `http://172.17.0.1:8380` (o cloudflared roda em Docker na rede padrão).
+No Cloudflare Tunnel, a rota de `live.rincon.dev.br` aponta para `http://172.17.0.1:8380` , no túnel **Orangepi** (o cloudflared roda em Docker na rede padrão).
 
 ### Chaves do Cloudflare Realtime
 
