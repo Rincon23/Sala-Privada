@@ -10,6 +10,7 @@ Uma sala só para a galera: canais de texto que guardam mensagens e imagens, sal
 
 - **Site e sinalização:** Node.js num container, publicado pelo Cloudflare Tunnel (sem abrir portas).
 - **Voz, vídeo e telas:** Cloudflare Realtime (SFU). Grátis até 1.000 GB por mês; o app para câmera e telas em 900 GB para nunca passar disso.
+- **Palco:** cada câmera, tela e pessoa sem câmera vira um quadro. O alfinete de um quadro fixa ele em cima, grande; dá para fixar quantos quiser (duas telas de alguém lado a lado, por exemplo) e os outros viram uma faixa de quadros menores. Esc desafixa tudo. Fixar só muda a sua tela.
 - **Vídeo:** player do YouTube em cada pessoa, sincronizado pelo servidor. O botão no canto do vídeo (ou dois cliques nele) põe em tela cheia; Esc sai. Link de playlist (ou de um vídeo dentro de uma playlist) põe a playlist inteira na fila, até 300 vídeos por sala: o app lista os vídeos pelo player do YouTube (playlists comuns e Mix) e, quando ele não lista (como os Envios de um canal), o servidor lê a página da playlist. Vídeos privados ou removidos saem da fila sozinhos.
 - **Anexos:** imagens e arquivos de até 25 MB, mandados no chat (dá para arrastar para qualquer chat aberto). Não existe mais envio de arquivos grandes.
 - **Mesa de sons:** 11 efeitos gerados por código (`npm run sounds`) e qualquer pessoa pode adicionar os seus, de até 3 minutos (WAV grande demais vira um WAV menor antes de subir). Só um admin tira sons da mesa.

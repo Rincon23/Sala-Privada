@@ -273,8 +273,9 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 .chip-btn.danger { background: var(--danger-soft); color: var(--danger); }
 .chip-btn:disabled { opacity: 0.7; cursor: default; }
 
-.focus { flex: 1; min-height: 0; display: flex; }
-.focus .tile { width: 100%; height: 100%; aspect-ratio: auto; }
+/* Fixados: um só ocupa a área toda; dois ou mais se arrumam como a grade, com --tile-w calculado. */
+.focus { flex: 1; min-height: 0; display: flex; flex-wrap: wrap; align-content: center; justify-content: center; gap: 8px; }
+.focus.single .tile { width: 100%; height: 100%; aspect-ratio: auto; }
 
 .grid { flex: 1; min-height: 0; display: flex; flex-wrap: wrap; align-content: center; justify-content: center; gap: 8px; }
 .stage.has-focus .grid {

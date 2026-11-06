@@ -69,7 +69,7 @@ const state = {
   micBeforeDeafen: true,
   watching: new Set(),
   previewing: new Set(),
-  focusKey: null,
+  pinned: [], // quadros fixados (p:<pessoa> e s:<tela>), na ordem em que aparecem
   tab: 'people',
   unread: 0,
   expanded: null,
@@ -599,7 +599,9 @@ function enterRoom() {
   setInterval(reportUsage, 15000);
   setInterval(checkHealth, 3000);
   setInterval(updateSpeaking, 100);
-  new ResizeObserver(layoutGrid).observe($('#grid'));
+  const stageObserver = new ResizeObserver(layoutGrid);
+  stageObserver.observe($('#grid'));
+  stageObserver.observe($('#focus'));
 
   // Entra na sala sem estar em nenhuma sala de voz; o microfone liga ao clicar numa.
   if (!state.config.realtimeReady) {
@@ -655,7 +657,7 @@ function leaveVoice({ notify = true } = {}) {
   sound('leave');
   state.watching.clear();
   state.previewing.clear();
-  state.focusKey = null;
+  state.pinned = [];
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   toggleSoundpad(false);
   stopSounds(); // os sons eram daquela sala
@@ -1010,7 +1012,6 @@ function watch(id) {
 
 function unwatch(id) {
   state.watching.delete(id);
-  if (state.focusKey === `s:${id}`) state.focusKey = null;
   reconcile();
   renderAll();
 }
@@ -1594,35 +1595,42 @@ function tileKeys() {
   return keys;
 }
 
+// Põe os quadros no lugar: os fixados em cima (grandes) e o resto na grade, ou numa faixa
+// de quadros menores quando há algo fixado.
 function renderStage() {
   if (!state.inRoom) return;
   const keys = tileKeys();
-  if (state.focusKey && !keys.includes(state.focusKey)) state.focusKey = null;
+  // Quadro que sumiu (a pessoa saiu, a tela parou) sai dos fixados sozinho.
+  state.pinned = state.pinned.filter((k) => keys.includes(k));
   for (const [key, tile] of tiles) {
     if (keys.includes(key)) continue;
     tile.el.remove();
     tiles.delete(key);
   }
-  const grid = $('#grid');
-  const focus = $('#focus');
   for (const key of keys) updateTile(key, tiles.get(key) || createTile(key));
 
-  if (state.focusKey) {
-    const el = tiles.get(state.focusKey).el;
-    if (el.parentElement !== focus) focus.append(el);
-  }
-  keys
-    .filter((k) => k !== state.focusKey)
-    .forEach((key, i) => {
-      const el = tiles.get(key).el;
-      if (grid.children[i] !== el) grid.insertBefore(el, grid.children[i] || null);
-    });
+  const pinned = state.pinned;
+  placeTiles($('#focus'), pinned);
+  placeTiles(
+    $('#grid'),
+    keys.filter((k) => !pinned.includes(k)),
+  );
   for (const tile of tiles.values()) if (tile.stream && tile.video.paused) tile.video.play().catch(() => {});
 
-  $('#stage').classList.toggle('has-focus', !!state.focusKey);
-  $('#focus').hidden = !state.focusKey;
+  $('#stage').classList.toggle('has-focus', pinned.length > 0);
+  $('#focus').hidden = !pinned.length;
+  $('#focus').classList.toggle('single', pinned.length === 1);
   renderLivebar();
   layoutGrid();
+}
+
+// Coloca os quadros de keys dentro de box, nessa ordem, mexendo só no que mudou de lugar
+// (tirar e pôr de volta um vídeo faz ele piscar).
+function placeTiles(box, keys) {
+  keys.forEach((key, i) => {
+    const el = tiles.get(key).el;
+    if (box.children[i] !== el) box.insertBefore(el, box.children[i] || null);
+  });
 }
 
 function createTile(key) {
@@ -1659,7 +1667,8 @@ const ACTIONS = {
   flip: ['flip', 'Virar a câmera'],
   mute: ['volume', 'Silenciar o som da tela'],
   unmute: ['volume-off', 'Ativar o som da tela'],
-  focus: ['focus', 'Destacar'],
+  pin: ['pin', 'Fixar'],
+  unpin: ['pin-off', 'Desafixar'],
   fullscreen: ['maximize', 'Tela cheia'],
   close: ['x', 'Fechar'],
 };
@@ -1673,7 +1682,7 @@ function updateTile(key, tile) {
   let speaker = '';
   let mirror = false;
   let icons = '';
-  let actions = ['focus', 'fullscreen'];
+  let actions = [state.pinned.includes(key) ? 'unpin' : 'pin', 'fullscreen'];
 
   if (type === 'p') {
     const p = state.participants.get(id);
@@ -1712,6 +1721,7 @@ function updateTile(key, tile) {
   }
 
   tile.el.classList.toggle('screen', type === 's');
+  tile.el.classList.toggle('pinned', state.pinned.includes(key));
   tile.el.classList.toggle('mirror', mirror);
   tile.el.classList.toggle('has-video', !!stream?.getVideoTracks().length);
   tile.el.dataset.speaker = speaker;
@@ -1737,8 +1747,11 @@ function updateTile(key, tile) {
 
 function tileAction(key, act, tile) {
   const id = key.slice(2);
-  if (act === 'focus') {
-    state.focusKey = state.focusKey === key ? null : key;
+  if (act === 'pin') {
+    if (!state.pinned.includes(key)) state.pinned.push(key);
+    renderStage();
+  } else if (act === 'unpin') {
+    state.pinned = state.pinned.filter((k) => k !== key);
     renderStage();
   } else if (act === 'fullscreen') {
     toggleFullscreen(tile);
@@ -1766,15 +1779,24 @@ function toggleFullscreen(tile) {
   else tile.video.webkitEnterFullscreen?.();
 }
 
-// Escolhe o número de colunas que deixa os quadros (16:9) maiores no espaço disponível.
+// Escolhe o número de colunas que deixa os quadros (16:9) maiores no espaço disponível:
+// na grade (sem nada fixado) ou na área dos fixados (com mais de um).
 function layoutGrid() {
   const grid = $('#grid');
-  if (state.focusKey) return grid.style.removeProperty('--tile-w');
-  const n = grid.children.length;
+  const focus = $('#focus');
+  const pinned = state.pinned.length;
+  if (pinned) grid.style.removeProperty('--tile-w');
+  else fitTiles(grid, grid.children.length);
+  if (pinned > 1) fitTiles(focus, pinned);
+  else focus.style.removeProperty('--tile-w');
+}
+
+function fitTiles(box, n) {
   if (!n) return;
   const gap = 8;
-  const width = grid.clientWidth;
-  const height = grid.clientHeight;
+  const width = box.clientWidth;
+  const height = box.clientHeight;
+  if (!width || !height) return;
   let best = 0;
   for (let cols = 1; cols <= n; cols++) {
     const rows = Math.ceil(n / cols);
@@ -1783,7 +1805,7 @@ function layoutGrid() {
     if (h * rows + gap * (rows - 1) > height) w = (((height - gap * (rows - 1)) / rows) * 16) / 9;
     best = Math.max(best, Math.floor(w));
   }
-  grid.style.setProperty('--tile-w', `${Math.max(best, 120)}px`);
+  box.style.setProperty('--tile-w', `${Math.max(best, 120)}px`);
 }
 
 function renderLivebar() {
@@ -3660,8 +3682,8 @@ function bindRoomUi() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && $('#yt-wrap').classList.contains('pseudo-full')) return toggleVideoFull(false);
     if (e.key === 'Escape' && !$('#soundpad').hidden) return toggleSoundpad(false);
-    if (e.key === 'Escape' && state.focusKey && !document.fullscreenElement) {
-      state.focusKey = null;
+    if (e.key === 'Escape' && state.pinned.length && !document.fullscreenElement) {
+      state.pinned = [];
       renderStage();
     }
   });
