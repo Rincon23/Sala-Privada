@@ -44,7 +44,8 @@ const settings = {
   outId: store.get('outId', ''),
   noise: store.get('noise', true),
   quality: store.get('quality', '1080p30'),
-  autoWatch: store.get('autoWatch', false),
+  // Live de alguém da sala abre sozinha (dá para desligar em Configurações para gastar menos dados).
+  autoWatch: store.get('autoWatch', true),
 };
 
 const state = {
@@ -563,8 +564,12 @@ function onStreamAdded(stream) {
   state.streams.set(stream.id, stream);
   if (isNew && stream.kind === 'screen' && stream.ownerId !== state.me.id && inMyVoice(stream.ownerId)) {
     const owner = state.participants.get(stream.ownerId)?.name || 'Alguém';
-    if (settings.autoWatch) state.watching.add(stream.id);
-    else toast(`${owner} começou a compartilhar (${stream.label})`, { action: 'Assistir', onAction: () => watch(stream.id) });
+    if (settings.autoWatch) {
+      state.watching.add(stream.id);
+      toast(`${owner} começou uma live (${stream.label}).`);
+    } else {
+      toast(`${owner} começou a compartilhar (${stream.label})`, { action: 'Assistir', onAction: () => watch(stream.id) });
+    }
   }
   reconcile();
   renderAll();
@@ -785,6 +790,9 @@ function joinVoice(id, { show = true } = {}) {
       joinInfo.startCam = false;
       startCamera();
     }
+  }
+  if (settings.autoWatch) {
+    for (const st of state.streams.values()) if (st.kind === 'screen' && st.ownerId !== state.me.id && inMyVoice(st.ownerId)) state.watching.add(st.id);
   }
   syncMusic();
   bindChat(voiceChat, id);
@@ -1797,17 +1805,59 @@ function closePersonMenu() {
   $('#ctx-menu').hidden = true;
 }
 
+const PERSON_TARGETS = '#people .person[data-id], #channel-list .ch-member[data-member], #stage .tile[data-key^="p:"]';
+
+function personAt(el) {
+  return state.participants.get(el.dataset.id || el.dataset.member || el.dataset.key.slice(2));
+}
+
+// No mouse, o menu abre no botão direito. No toque, abre num toque rápido: segurar o dedo é para
+// arrastar (e o navegador transforma o "segurar" num botão direito, que aqui é ignorado).
 function bindPersonMenu() {
+  let lastPointer = 'mouse';
+  let pressedAt = 0;
+  let lastTap = { el: null, at: 0 };
+  document.addEventListener(
+    'pointerdown',
+    (e) => {
+      lastPointer = e.pointerType || 'mouse';
+      pressedAt = Date.now();
+    },
+    true,
+  );
+  const byTouch = (e) => (e.pointerType || lastPointer) !== 'mouse';
+  const HOLD_MS = 450; // dedo parado mais que isso foi "segurar", não toque
   document.addEventListener('contextmenu', (e) => {
     if (!state.inRoom) return;
-    const el = e.target.closest('#people .person[data-id], #channel-list .ch-member[data-member], #stage .tile[data-key^="p:"]');
+    const el = e.target.closest(PERSON_TARGETS);
     if (!el) return closePersonMenu();
-    const id = el.dataset.id || el.dataset.member || el.dataset.key.slice(2);
-    const p = state.participants.get(id);
+    const p = personAt(el);
     if (!p) return;
     e.preventDefault();
+    if (byTouch(e)) return;
     openPersonMenu(p, e.clientX, e.clientY, el);
   });
+  // Toque rápido numa pessoa (na lista, numa sala de voz ou no palco) abre o menu. Vem antes dos
+  // outros cliques, para não abrir também as opções na lista de Pessoas.
+  document.addEventListener(
+    'click',
+    (e) => {
+      if (!state.inRoom || !byTouch(e) || e.target.closest('button, input, label, a, .person-vol, .person-actions')) return;
+      const el = e.target.closest(PERSON_TARGETS);
+      const p = el && personAt(el);
+      if (!p) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (Date.now() - pressedAt > HOLD_MS) return;
+      // Dois toques seguidos num quadro do palco são tela cheia, não menu.
+      const now = Date.now();
+      const double = lastTap.el === el && now - lastTap.at < 350;
+      lastTap = { el, at: now };
+      if (double) return closePersonMenu();
+      openPersonMenu(p, e.clientX, e.clientY, el);
+    },
+    true,
+  );
   $('#ctx-menu').addEventListener('click', (e) => {
     const p = state.participants.get(menuPerson?.id);
     const ctx = e.target.closest('[data-ctx]')?.dataset.ctx;
