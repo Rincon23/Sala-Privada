@@ -7,9 +7,10 @@ const HOLD_MS = 350;
 const EDGE_PX = 40; // perto da borda da lista, ela rola sozinha
 
 // root: onde ficam os itens (e que rola). selector: o que dá para arrastar.
-// canDrag(el, event) diz se aquele item pode; onMove(el, x, y) mostra onde vai cair;
+// canDrag(el, event) diz se aquele item pode; onMove(el, x, y, ghost) mostra onde vai cair;
 // onDrop(el) aplica; onEnd() limpa as marcas (sempre roda, até se cancelar).
-export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd }) {
+// settle: ao soltar, o fantasma desliza até o lugar final do item em vez de sumir.
+export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd, settle = false }) {
   let pending = null; // apertou, mas ainda não virou arrasto
   let drag = null;
 
@@ -26,7 +27,7 @@ export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd }
     document.body.classList.add('is-dragging');
     drag = { el, ghost, dx: x - box.left, dy: y - box.top, x, y, frame: requestAnimationFrame(autoScroll) };
     navigator.vibrate?.(15);
-    onMove(el, x, y);
+    onMove(el, x, y, ghost);
   };
 
   const finish = (dropped) => {
@@ -38,8 +39,6 @@ export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd }
     const { el, ghost, frame } = drag;
     drag = null;
     cancelAnimationFrame(frame);
-    ghost.remove();
-    el.classList.remove('drag-source');
     document.body.classList.remove('is-dragging');
     // O clique que vem logo depois de soltar não pode abrir o canal.
     window.addEventListener('click', swallow, { capture: true, once: true });
@@ -49,6 +48,30 @@ export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd }
     } finally {
       onEnd();
     }
+    if (!settle || !el.isConnected) {
+      ghost.remove();
+      el.classList.remove('drag-source');
+      return;
+    }
+    // O item fica escondido enquanto o fantasma desliza até ele; quando chega, troca um pelo outro.
+    el.classList.remove('drag-source');
+    el.classList.add('drag-settling');
+    const from = ghost.getBoundingClientRect();
+    const to = el.getBoundingClientRect();
+    ghost.style.height = `${from.height}px`;
+    const anim = ghost.animate(
+      [
+        { left: `${from.left}px`, top: `${from.top}px`, width: `${from.width}px`, height: `${from.height}px`, transform: 'scale(1)' },
+        { left: `${to.left}px`, top: `${to.top}px`, width: `${to.width}px`, height: `${to.height}px`, transform: 'scale(1)', boxShadow: 'none' },
+      ],
+      { duration: 200, easing: 'cubic-bezier(0.2, 0.9, 0.3, 1)', fill: 'forwards' },
+    );
+    const done = () => {
+      ghost.remove();
+      el.classList.remove('drag-settling');
+    };
+    anim.onfinish = done;
+    anim.oncancel = done;
   };
 
   const autoScroll = () => {
@@ -57,7 +80,7 @@ export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd }
     const step = drag.y < box.top + EDGE_PX ? -8 : drag.y > box.bottom - EDGE_PX ? 8 : 0;
     if (step) {
       root.scrollTop += step;
-      onMove(drag.el, drag.x, drag.y);
+      onMove(drag.el, drag.x, drag.y, drag.ghost);
     }
     drag.frame = requestAnimationFrame(autoScroll);
   };
@@ -83,7 +106,7 @@ export function makeDraggable(root, { selector, canDrag, onMove, onDrop, onEnd }
     drag.y = e.clientY;
     drag.ghost.style.left = `${e.clientX - drag.dx}px`;
     drag.ghost.style.top = `${e.clientY - drag.dy}px`;
-    onMove(drag.el, e.clientX, e.clientY);
+    onMove(drag.el, e.clientX, e.clientY, drag.ghost);
   });
 
   window.addEventListener('pointerup', () => finish(true));

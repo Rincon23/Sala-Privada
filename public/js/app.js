@@ -1917,19 +1917,25 @@ function renderStage() {
     for (const key of keys) if (!tiles.get(key).el.parentElement) $('#grid').append(tiles.get(key).el);
     return layoutGrid();
   }
-  placeTiles($('#focus'), pinned);
-  placeTiles(
-    $('#grid'),
-    keys.filter((k) => !pinned.includes(k)),
-  );
+  const rest = keys.filter((k) => !pinned.includes(k));
+  const place = () => {
+    placeTiles($('#focus'), pinned);
+    placeTiles($('#grid'), rest);
+    $('#stage').classList.toggle('has-focus', pinned.length > 0);
+    $('#focus').hidden = !pinned.length;
+    $('#focus').classList.toggle('single', pinned.length === 1);
+    layoutGrid();
+  };
+  // Só anima quando a arrumação muda (fixar, desafixar, alguém entrar ou sair), e com o palco à vista.
+  const arrangement = `${pinned.join()}|${rest.join()}`;
+  if (arrangement !== stageArrangement && stageArrangement && !$('#stage').hidden) animateTiles(place);
+  else place();
+  stageArrangement = arrangement;
   for (const tile of tiles.values()) if (tile.stream && tile.video.paused) tile.video.play().catch(() => {});
-
-  $('#stage').classList.toggle('has-focus', pinned.length > 0);
-  $('#focus').hidden = !pinned.length;
-  $('#focus').classList.toggle('single', pinned.length === 1);
   renderLivebar();
-  layoutGrid();
 }
+
+let stageArrangement = '';
 
 // Coloca os quadros de keys dentro de box, nessa ordem, mexendo só no que mudou de lugar
 // (tirar e pôr de volta um vídeo faz ele piscar).
@@ -2111,12 +2117,12 @@ function bindStageDrag() {
   makeDraggable($('#stage'), {
     selector: '.tile',
     canDrag: (el, e) => !e.target.closest('button') && !document.fullscreenElement && tiles.size > 1,
-    onMove(el, x, y) {
+    onMove(el, x, y, ghost) {
       if (!stageDragging) {
         stageDragging = true;
         document.body.classList.add('stage-dragging');
       }
-      liveMoveTile(el, x, y);
+      liveMoveTile(el, x, y, ghost);
     },
     onDrop() {
       commitStageOrder();
@@ -2126,6 +2132,7 @@ function bindStageDrag() {
       document.body.classList.remove('stage-dragging');
       renderStage();
     },
+    settle: true,
   });
 }
 
@@ -2134,42 +2141,98 @@ function inside(box, x, y) {
   return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
 
-// O quadro embaixo do ponteiro decide: na metade esquerda o arrastado entra antes dele, na direita,
-// depois. No vão entre quadros nada muda (assim os quadros não ficam pulando).
-function liveMoveTile(el, x, y) {
+// Onde o quadro fica de verdade, sem a animação que está movendo ele agora (as animações do FLIP
+// usam origem no canto de cima, então dá para descontar o deslocamento e a escala).
+function layoutRect(t) {
+  const r = t.getBoundingClientRect();
+  const tr = getComputedStyle(t).transform;
+  if (!tr || tr === 'none') return r;
+  const m = new DOMMatrixReadOnly(tr);
+  const width = r.width / (m.a || 1);
+  const height = r.height / (m.d || 1);
+  const left = r.left - m.e;
+  const top = r.top - m.f;
+  return { left, top, width, height, right: left + width, bottom: top + height };
+}
+
+// Quem decide é o centro do quadro arrastado: passou do meio de um vizinho, já troca de lugar com
+// ele (como os widgets do celular). Fica antes de todo quadro que está numa linha de baixo, ou na
+// mesma linha mais à direita (numa coluna só, mais abaixo).
+function liveMoveTile(el, x, y, ghost) {
+  const g = ghost?.getBoundingClientRect();
+  const cx = g ? g.left + g.width / 2 : x;
+  const cy = g ? g.top + g.height / 2 : y;
   const focus = $('#focus');
   const grid = $('#grid');
-  const area = !focus.hidden && inside(focus, x, y) ? focus : inside(grid, x, y) ? grid : null;
+  const area = !focus.hidden && inside(focus, cx, cy) ? focus : inside(grid, cx, cy) ? grid : !focus.hidden && inside(focus, x, y) ? focus : inside(grid, x, y) ? grid : null;
   if (!area) return;
-  const list = [...area.children].filter((t) => t.classList.contains('tile') && t !== el);
-  const target = list.find((t) => inside(t, x, y));
-  let before = null;
-  if (target) {
-    const box = target.getBoundingClientRect();
-    before = x > box.left + box.width / 2 ? list[list.indexOf(target) + 1] || null : target;
-  } else if (el.parentElement === area) {
-    return;
-  }
-  if (el.parentElement === area && (el.nextElementSibling === before || before === el)) return;
+  edgeScroll(area, cx);
+  const others = [...area.children].filter((t) => t.classList.contains('tile') && t !== el);
+  const rects = others.map(layoutRect);
+  // Lado a lado (linhas) ou um embaixo do outro (coluna)?
+  const sideBySide = rects.some((a, i) => rects.some((b, j) => i !== j && Math.abs(a.top - b.top) < 4));
+  // Basta o quadro arrastado cobrir mais da metade do vizinho para trocar com ele: a borda da frente
+  // dele passou do meio do vizinho. Vindo de outra área, vale o centro.
+  const inArea = el.parentElement === area;
+  const half = (sideBySide ? g?.width || 0 : g?.height || 0) / 2;
+  const pos = sideBySide ? cx : cy;
+  let index = 0;
+  rects.forEach((r, i) => {
+    let before;
+    if (cy > r.bottom) before = true;
+    else if (cy < r.top) before = false;
+    else {
+      const middle = sideBySide ? r.left + r.width / 2 : r.top + r.height / 2;
+      const wasBefore = inArea && !!(others[i].compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+      if (!inArea) before = pos > middle;
+      else if (wasBefore) before = pos - half >= middle; // continua antes até a borda de trás do arrastado passar o meio dele
+      else before = pos + half > middle; // passa a ficar antes quando a borda da frente passa o meio
+    }
+    if (before) index++;
+  });
+  const next = others[index] || null;
+  if (el.parentElement === area && el.nextElementSibling === next) return;
   animateTiles(() => {
-    area.insertBefore(el, before);
+    area.insertBefore(el, next);
     $('#focus').classList.toggle('single', $('#focus').children.length === 1);
     layoutGrid();
   });
 }
 
-// FLIP: guarda onde cada quadro estava, muda a ordem e anima cada um do lugar antigo para o novo.
+// A faixa de quadros menores rola sozinha quando o quadro chega perto da borda dela.
+function edgeScroll(area, cx) {
+  if (area.id !== 'grid' || area.scrollWidth <= area.clientWidth) return;
+  const r = area.getBoundingClientRect();
+  if (cx < r.left + 48) area.scrollLeft -= 14;
+  else if (cx > r.right - 48) area.scrollLeft += 14;
+}
+
+// FLIP: guarda onde cada quadro estava (e o tamanho), aplica a mudança e anima cada um do lugar
+// antigo para o novo. Quadro que acabou de aparecer entra crescendo.
 function animateTiles(change) {
-  const all = [...$$('#stage .tile')];
-  const before = new Map(all.map((t) => [t, t.getBoundingClientRect()]));
+  const before = new Map([...$$('#stage .tile')].map((t) => [t, t.getBoundingClientRect()]));
   change();
-  for (const t of all) {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  for (const t of $$('#stage .tile')) {
     const a = before.get(t);
+    if (!a) {
+      t.animate([{ opacity: 0, transform: 'scale(0.92)' }, { opacity: 1, transform: 'none' }], { duration: 220, easing: 'ease-out' });
+      continue;
+    }
     const b = t.getBoundingClientRect();
+    if (!b.width || !a.width) continue;
     const dx = a.left - b.left;
     const dy = a.top - b.top;
-    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
-    t.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], { duration: 220, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' });
+    const sx = a.width / b.width;
+    const sy = a.height / b.height;
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1 && Math.abs(sx - 1) < 0.01 && Math.abs(sy - 1) < 0.01) continue;
+    t.animate(
+      [
+        { transformOrigin: '0 0', transform: `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})` },
+        { transformOrigin: '0 0', transform: 'none' },
+      ],
+      { duration: 260, easing: 'cubic-bezier(0.2, 0.9, 0.3, 1)' },
+    );
   }
 }
 
