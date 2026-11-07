@@ -981,13 +981,23 @@ async function replaceLocalTrack(entry, track) {
   old.stop();
 }
 
+// Com echoCancellation: true, o Google Chrome escolhe por experimentos que só ele recebe (o Brave e o Edge
+// não) o cancelamento de eco do próprio Windows ou um que usa todo o som do computador como referência.
+// Com isso, enquanto o microfone está aberto, vídeos e músicas tocando no PC ficavam só com a voz (no Meet
+// também). "remote-only" (Chrome 141+) cancela só o som que chega pela chamada e roda no WebRTC comum,
+// fora desses caminhos. Navegadores mais antigos leem a string como true.
+const IS_GOOGLE_CHROME = !!navigator.userAgentData?.brands?.some((b) => b.brand === 'Google Chrome');
+
 function micConstraints() {
-  return {
+  const constraints = {
     deviceId: settings.micId ? { ideal: settings.micId } : undefined,
     echoCancellation: true,
     noiseSuppression: settings.noise,
     autoGainControl: true,
   };
+  // Isolamento de voz roda no mesmo processamento do Chrome e venceria o "remote-only".
+  if (IS_GOOGLE_CHROME) Object.assign(constraints, { echoCancellation: 'remote-only', voiceIsolation: false });
+  return constraints;
 }
 
 function cameraConstraints() {
@@ -4519,7 +4529,9 @@ function bindSettings() {
   $('#set-noise').addEventListener('change', (e) => {
     settings.noise = e.target.checked;
     store.set('noise', settings.noise);
-    local.mic?.items[0].track.applyConstraints({ noiseSuppression: settings.noise }).catch(() => {});
+    // Manda tudo de novo: o que ficar de fora volta ao padrão do navegador (o eco voltaria ao modo do Chrome).
+    const { deviceId, ...processing } = micConstraints();
+    local.mic?.items[0].track.applyConstraints(processing).catch(() => {});
   });
   $('#set-quality').addEventListener('change', (e) => {
     settings.quality = e.target.value;
